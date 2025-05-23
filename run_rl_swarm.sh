@@ -363,14 +363,6 @@ else
             PORT=3000
         fi
 
-        # Kiểm tra server localhost có chạy không
-        echo -e "${CYAN}${BOLD}[✓] Checking if server is running on localhost:$PORT...${NC}"
-        if ! curl --output /dev/null --silent --fail "http://localhost:$PORT" --connect-timeout 5; then
-            echo -e "${RED}${BOLD}[✗] Server at localhost:$PORT is not running. Check modal-login.log for details.${NC}"
-            [ -f modal-login.log ] && cat modal-login.log
-            return 1
-        fi
-
         # Khởi động tunnel cloudflared
         echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
         TUNNEL_TYPE="cloudflared"
@@ -379,7 +371,7 @@ else
         
         # Tăng thời gian chờ lên 20 giây
         counter=0
-        MAX_WAIT=20
+        MAX_WAIT=2000
         echo -e "${CYAN}${BOLD}[✓] Waiting for cloudflared URL (up to $MAX_WAIT seconds)...${NC}"
         while [ $counter -lt $MAX_WAIT ]; do
             # Sử dụng regex chặt chẽ hơn để lấy URL
