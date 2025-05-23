@@ -353,7 +353,7 @@ else
             echo -e "\n${CYAN}${BOLD}[✓] Starting cloudflared tunnel...${NC}"
             TUNNEL_TYPE="cloudflared"
             cloudflared tunnel --url http://localhost:3000 > cloudflared_output.log 2>&1 &
-            sleep 5
+            sleep 10
             TUNNEL_PID=$!
             
             counter=0
@@ -368,14 +368,14 @@ else
                         return 0
                     else
                         echo -e "${RED}${BOLD}[✗] Cloudflared URL is not accessible.${NC}"
-                        kill $TUNNEL_PID 2>/dev/null || true
+                        #kill $TUNNEL_PID 2>/dev/null || true
                         break
                     fi
                 fi
                 sleep 1
                 counter=$((counter + 1))
             done
-            kill $TUNNEL_PID 2>/dev/null || true
+            #kill $TUNNEL_PID 2>/dev/null || true
         fi
         return 1
     }
