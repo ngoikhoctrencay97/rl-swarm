@@ -385,7 +385,7 @@ else
                 MAX_ATTEMPTS=5
                 while [ $attempt -lt $MAX_ATTEMPTS ]; do
                     # Sử dụng curl với tùy chọn xử lý redirect và SSL linh hoạt
-                    if curl --output /dev/null --silent --fail --connect-timeout 10 --max-time 30 -L --retry 2 --retry-delay 2 "$CLOUDFLARED_URL"; then
+                    if curl --output /dev/null --silent --fail --connect-timeout 30 --max-time 60 -L --retry 2 --retry-delay 2 "$CLOUDFLARED_URL"; then
                         echo -e "${GREEN}${BOLD}[✓] Cloudflared URL is accessible: $CLOUDFLARED_URL${NC}"
                         FORWARDING_URL="$CLOUDFLARED_URL"
                         return 0
