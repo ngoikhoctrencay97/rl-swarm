@@ -22,7 +22,7 @@ export TUNNEL_TYPE=""
 DEFAULT_PUB_MULTI_ADDRS=""
 PUB_MULTI_ADDRS=${PUB_MULTI_ADDRS:-$DEFAULT_PUB_MULTI_ADDRS}
 
-DEFAULT_PEER_MULTI_ADDRS=""
+DEFAULT_PEER_MULTI_ADDRS="/ip4/38.101.215.13/tcp/30002/p2p/QmQ2gEXoPJg6iMBSUFWGzAabS2VhnzuS782Y637hGjfsRJ"
 PEER_MULTI_ADDRS=${PEER_MULTI_ADDRS:-$DEFAULT_PEER_MULTI_ADDRS}
 
 DEFAULT_HOST_MULTI_ADDRS="/ip4/0.0.0.0/tcp/38331"
@@ -347,36 +347,67 @@ else
         return 1
     }
 
-    try_cloudflared() {
+   try_cloudflared() {
         echo -e "\n${CYAN}${BOLD}[✓] Trying cloudflared...${NC}"
-        if install_cloudflared; then
-            echo -e "\n${CYAN}${BOLD}[✓] Starting cloudflared tunnel...${NC}"
-            TUNNEL_TYPE="cloudflared"
-            cloudflared tunnel --url http://localhost:3000 > cloudflared_output.log 2>&1 &
-            sleep 10
-            TUNNEL_PID=$!
-            
-            counter=0
-            MAX_WAIT=10
-            while [ $counter -lt $MAX_WAIT ]; do
-                CLOUDFLARED_URL=$(grep -o 'https://[^ ]*\.trycloudflare.com' cloudflared_output.log | head -n1)
-                if [ -n "$CLOUDFLARED_URL" ]; then
-                    echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel is started successfully.${NC}"
-                    echo -e "\n${CYAN}${BOLD}[✓] Checking if cloudflared URL is working...${NC}"
-                    if check_url "$CLOUDFLARED_URL"; then
-                        FORWARDING_URL="$CLOUDFLARED_URL"
-                        return 0
-                    else
-                        echo -e "${RED}${BOLD}[✗] Cloudflared URL is not accessible.${NC}"
-                        #kill $TUNNEL_PID 2>/dev/null || true
-                        break
-                    fi
-                fi
-                sleep 1
-                counter=$((counter + 1))
-            done
-            #kill $TUNNEL_PID 2>/dev/null || true
+        
+        # Kiểm tra và cài đặt cloudflared
+        if ! install_cloudflared; then
+            echo -e "${RED}${BOLD}[✗] Failed to install cloudflared. Check cloudflared_download.log for details.${NC}"
+            [ -f cloudflared_download.log ] && cat cloudflared_download.log
+            return 1
         fi
+
+        # Kiểm tra biến PORT
+        if [ -z "$PORT" ]; then
+            echo -e "${RED}${BOLD}[✗] PORT variable is not set. Defaulting to 3000.${NC}"
+            PORT=3000
+        fi
+
+        # Kiểm tra server localhost có chạy không
+        echo -e "${CYAN}${BOLD}[✓] Checking if server is running on localhost:$PORT...${NC}"
+        if ! curl --output /dev/null --silent --fail "http://localhost:$PORT" --connect-timeout 5; then
+            echo -e "${RED}${BOLD}[✗] Server at localhost:$PORT is not running. Check modal-login.log for details.${NC}"
+            [ -f modal-login.log ] && cat modal-login.log
+            return 1
+        fi
+
+        # Khởi động tunnel cloudflared
+        echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
+        TUNNEL_TYPE="cloudflared"
+        cloudflared tunnel --url "http://localhost:$PORT" 2>&1 | tee cloudflared_output.log &
+        TUNNEL_PID=$!
+        
+        # Tăng thời gian chờ lên 20 giây
+        counter=0
+        MAX_WAIT=20
+        echo -e "${CYAN}${BOLD}[✓] Waiting for cloudflared URL (up to $MAX_WAIT seconds)...${NC}"
+        while [ $counter -lt $MAX_WAIT ]; do
+            # Sử dụng regex chặt chẽ hơn để lấy URL
+            CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared_output.log | head -n1)
+            if [ -n "$CLOUDFLARED_URL" ]; then
+                echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started successfully: $CLOUDFLARED_URL${NC}"
+                
+                # Kiểm tra URL có truy cập được không
+                echo -e "${CYAN}${BOLD}[✓] Checking if cloudflared URL is accessible...${NC}"
+                if curl --output /dev/null --silent --fail --connect-timeout 5 "$CLOUDFLARED_URL"; then
+                    FORWARDING_URL="$CLOUDFLARED_URL"
+                    echo -e "${GREEN}${BOLD}[✓] Cloudflared URL is accessible: $FORWARDING_URL${NC}"
+                    return 0
+                else
+                    echo -e "${RED}${BOLD}[✗] Cloudflared URL is not accessible: $CLOUDFLARED_URL${NC}"
+                    kill $TUNNEL_PID 2>/dev/null || true
+                    return 1
+                fi
+            fi
+            sleep 1
+            counter=$((counter + 1))
+        done
+
+        # Nếu hết thời gian chờ mà không lấy được URL
+        echo -e "${RED}${BOLD}[✗] Failed to retrieve cloudflared URL after $MAX_WAIT seconds.${NC}"
+        echo -e "${RED}${BOLD}[✗] Check cloudflared_output.log for details:${NC}"
+        [ -f cloudflared_output.log ] && cat cloudflared_output.log
+        kill $TUNNEL_PID 2>/dev/null || true
         return 1
     }
 
@@ -650,3 +681,7 @@ else
 fi
 
 wait
+Beta
+0 / 10
+used queries
+1
