@@ -352,7 +352,7 @@ else
         if install_cloudflared; then
             echo -e "\n${CYAN}${BOLD}[✓] Starting cloudflared tunnel...${NC}"
             TUNNEL_TYPE="cloudflared"
-            cloudflared tunnel --url http://localhost:$PORT > cloudflared_output.log 2>&1 &
+            cloudflared tunnel --url http://localhost:3000 > cloudflared_output.log 2>&1 &
             sleep 5
             TUNNEL_PID=$!
             
