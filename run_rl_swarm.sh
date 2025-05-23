@@ -328,36 +328,57 @@ else
     }
 
     try_cloudflared() {
-      echo -e "\n${CYAN}${BOLD}[✓] Trying cloudflared...${NC}"
-      
-      # Khởi động tunnel cloudflared
-      echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
-      TUNNEL_TYPE="cloudflared"
-      cloudflared tunnel --url http://localhost:$PORT > cloudflared_output.log 2>&1 &
-      TUNNEL_PID=$!
-      
-      # Chờ URL xuất hiện, tối đa 30 giây
-      counter=0
-      MAX_WAIT=30
-      echo -e "${CYAN}${BOLD}[✓] Waiting for cloudflared URL (up to $MAX_WAIT seconds)...${NC}"
-      while [ $counter -lt $MAX_WAIT ]; do
-          CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared_output.log | head -n1)
-          if [ -n "$CLOUDFLARED_URL" ]; then
-              echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started: $CLOUDFLARED_URL${NC}"
-              FORWARDING_URL="$CLOUDFLARED_URL"
-              return 0
-          fi
-          sleep 1
-          counter=$((counter + 1))
-      done
-  
-      # Nếu không lấy được URL
-      echo -e "${RED}${BOLD}[✗] Failed to retrieve cloudflared URL after $MAX_WAIT seconds.${NC}"
-      echo -e "${RED}${BOLD}[✗] Check cloudflared_output.log for details:${NC}"
-      [ -f cloudflared_output.log ] && cat cloudflared_output.log
-      kill $TUNNEL_PID 2>/dev/null || true
-      return 1
-  }
+    echo -e "\n${CYAN}${BOLD}[✓] Trying cloudflared...${NC}"
+    
+    # Kiểm tra và cài đặt cloudflared
+    if ! install_cloudflared; then
+        echo -e "${RED}${BOLD}[✗] Failed to install cloudflared. Check cloudflared_download.log for details.${NC}"
+        [ -f cloudflared_download.log ] && cat cloudflared_download.log
+        return 1
+    fi
+
+    # Kiểm tra biến PORT
+    if [ -z "$PORT" ]; then
+        echo -e "${YELLOW}${BOLD}[!] PORT variable is not set. Defaulting to 3000.${NC}"
+        PORT=3000
+    fi
+
+    # Kiểm tra server localhost
+    echo -e "${CYAN}${BOLD}[✓] Checking if server is running on localhost:$PORT...${NC}"
+    if ! curl --output /dev/null --silent --fail --connect-timeout 5 "http://localhost:$PORT"; then
+        echo -e "${RED}${BOLD}[✗] Server at localhost:$PORT is not running. Check modal-login.log for details.${NC}"
+        [ -f modal-login.log ] && cat modal-login.log
+        return 1
+    fi
+
+    # Khởi động tunnel cloudflared
+    echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
+    TUNNEL_TYPE="cloudflared"
+    cloudflared tunnel --url "http://localhost:$PORT" 2>&1 | tee cloudflared_output.log &
+    TUNNEL_PID=$!
+    
+    # Chờ URL xuất hiện, tối đa 30 giây
+    counter=0
+    MAX_WAIT=30
+    echo -e "${CYAN}${BOLD}[✓] Waiting for cloudflared URL (up to $MAX_WAIT seconds)...${NC}"
+    while [ $counter -lt $MAX_WAIT ]; do
+        CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared_output.log | head -n1)
+        if [ -n "$CLOUDFLARED_URL" ]; then
+            echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started: $CLOUDFLARED_URL${NC}"
+            FORWARDING_URL="$CLOUDFLARED_URL"
+            return 0
+        fi
+        sleep 1
+        counter=$((counter + 1))
+    done
+
+    # Nếu không lấy được URL
+    echo -e "${RED}${BOLD}[✗] Failed to retrieve cloudflared URL after $MAX_WAIT seconds.${NC}"
+    echo -e "${RED}${BOLD}[✗] Check cloudflared_output.log for details:${NC}"
+    [ -f cloudflared_output.log ] && cat cloudflared_output.log
+    kill $TUNNEL_PID 2>/dev/null || true
+    return 1
+}
   
       get_ngrok_url_method2() {
           local try_port
