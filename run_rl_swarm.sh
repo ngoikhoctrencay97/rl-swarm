@@ -359,37 +359,45 @@ else
 
         # Kiểm tra biến PORT
         if [ -z "$PORT" ]; then
-            echo -e "${RED}${BOLD}[✗] PORT variable is not set. Defaulting to 3000.${NC}"
+            echo -e "${YELLOW}${BOLD}[!] PORT variable is not set. Defaulting to 3000.${NC}"
             PORT=3000
         fi
 
         # Khởi động tunnel cloudflared
         echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
         TUNNEL_TYPE="cloudflared"
+        # Sử dụng tee để ghi log và hiển thị trên terminal
         cloudflared tunnel --url "http://localhost:$PORT" 2>&1 | tee cloudflared_output.log &
         TUNNEL_PID=$!
         
-        # Tăng thời gian chờ lên 20 giây
+        # Tăng thời gian chờ lên 30 giây để đảm bảo tunnel ổn định
         counter=0
-        MAX_WAIT=2000
+        MAX_WAIT=30
         echo -e "${CYAN}${BOLD}[✓] Waiting for cloudflared URL (up to $MAX_WAIT seconds)...${NC}"
         while [ $counter -lt $MAX_WAIT ]; do
-            # Sử dụng regex chặt chẽ hơn để lấy URL
+            # Sử dụng regex chặt chẽ để lấy URL
             CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared_output.log | head -n1)
             if [ -n "$CLOUDFLARED_URL" ]; then
-                echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started successfully: $CLOUDFLARED_URL${NC}"
+                echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started: $CLOUDFLARED_URL${NC}"
                 
-                # Kiểm tra URL có truy cập được không
+                # Kiểm tra URL với timeout dài hơn và nhiều lần thử
                 echo -e "${CYAN}${BOLD}[✓] Checking if cloudflared URL is accessible...${NC}"
-                if curl --output /dev/null --silent --fail --connect-timeout 5 "$CLOUDFLARED_URL"; then
-                    FORWARDING_URL="$CLOUDFLARED_URL"
-                    echo -e "${GREEN}${BOLD}[✓] Cloudflared URL is accessible: $FORWARDING_URL${NC}"
-                    return 0
-                else
-                    echo -e "${RED}${BOLD}[✗] Cloudflared URL is not accessible: $CLOUDFLARED_URL${NC}"
-                    kill $TUNNEL_PID 2>/dev/null || true
-                    return 1
-                fi
+                attempt=0
+                MAX_ATTEMPTS=3
+                while [ $attempt -lt $MAX_ATTEMPTS ]; do
+                    if curl --output /dev/null --silent --fail --connect-timeout 10 --max-time 15 "$CLOUDFLARED_URL"; then
+                        echo -e "${GREEN}${BOLD}[✓] Cloudflared URL is accessible: $CLOUDFLARED_URL${NC}"
+                        FORWARDING_URL="$CLOUDFLARED_URL"
+                        return 0
+                    fi
+                    echo -e "${YELLOW}${BOLD}[!] Attempt $((attempt + 1))/$MAX_ATTEMPTS: Cloudflared URL not yet accessible. Retrying...${NC}"
+                    sleep 2
+                    attempt=$((attempt + 1))
+                done
+                
+                echo -e "${RED}${BOLD}[✗] Cloudflared URL is not accessible after $MAX_ATTEMPTS attempts: $CLOUDFLARED_URL${NC}"
+                kill $TUNNEL_PID 2>/dev/null || true
+                return 1
             fi
             sleep 1
             counter=$((counter + 1))
