@@ -343,14 +343,6 @@ else
         PORT=3000
     fi
 
-    # Kiểm tra server localhost
-    echo -e "${CYAN}${BOLD}[✓] Checking if server is running on localhost:$PORT...${NC}"
-    if ! curl --output /dev/null --silent --fail --connect-timeout 5 "http://localhost:$PORT"; then
-        echo -e "${RED}${BOLD}[✗] Server at localhost:$PORT is not running. Check modal-login.log for details.${NC}"
-        [ -f modal-login.log ] && cat modal-login.log
-        return 1
-    fi
-
     # Khởi động tunnel cloudflared
     echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
     TUNNEL_TYPE="cloudflared"
