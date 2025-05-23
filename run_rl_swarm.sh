@@ -72,34 +72,14 @@ fi
 
 [ -f cuda.sh ] && rm cuda.sh; curl -o cuda.sh https://raw.githubusercontent.com/zunxbt/gensyn-testnet/main/cuda.sh && chmod +x cuda.sh && . ./cuda.sh
 
-while true; do
-    # Prompt the user
-    echo -e "\n\033[36m\033[1mPlease select a swarm to join:\n[A] Math\n[B] Math Hard\033[0m"
-    read -p "> " ab
-    ab=${ab:-A}  # Default to "A" if Enter is pressed
+# Thiết lập swarm mặc định là A (Math)
+echo -e "\n${CYAN}${BOLD}[✓] Selecting swarm: Math (default)${NC}"
+USE_BIG_SWARM=false
+SWARM_CONTRACT="$SMALL_SWARM_CONTRACT"
 
-    case $ab in
-        [Aa]*)  USE_BIG_SWARM=false; break ;;
-        [Bb]*)  USE_BIG_SWARM=true; break ;;
-        *)      echo ">>> Please answer A or B." ;;
-    esac
-done
-
-if [ "$USE_BIG_SWARM" = true ]; then
-    SWARM_CONTRACT="$BIG_SWARM_CONTRACT"
-else
-    SWARM_CONTRACT="$SMALL_SWARM_CONTRACT"
-fi
-while true; do
-    echo -e "\n\033[36m\033[1mHow many parameters (in billions)? [0.5, 1.5, 7, 32, 72]\033[0m"
-    read -p "> " pc
-    pc=${pc:-0.5}  # Default to "0.5" if the user presses Enter
-
-    case $pc in
-        0.5 | 1.5 | 7 | 32 | 72) PARAM_B=$pc; break ;;
-        *) echo ">>> Please answer in [0.5, 1.5, 7, 32, 72]." ;;
-    esac
-done
+# Thiết lập số lượng tham số mặc định là 32 tỷ
+echo -e "\n${CYAN}${BOLD}[✓] Selecting parameter count: 32 billion (default)${NC}"
+PARAM_B=32
 
 cleanup() {
     echo -e "${YELLOW}${BOLD}[✓] Shutting down processes...${NC}"
@@ -348,88 +328,51 @@ else
     }
 
     try_cloudflared() {
-        echo -e "\n${CYAN}${BOLD}[✓] Trying cloudflared...${NC}"
-        
-        # Kiểm tra và cài đặt cloudflared
-        if ! install_cloudflared; then
-            echo -e "${RED}${BOLD}[✗] Failed to install cloudflared. Check cloudflared_download.log for details.${NC}"
-            [ -f cloudflared_download.log ] && cat cloudflared_download.log
-            return 1
-        fi
-
-        # Kiểm tra biến PORT
-        if [ -z "$PORT" ]; then
-            echo -e "${YELLOW}${BOLD}[!] PORT variable is not set. Defaulting to 3000.${NC}"
-            PORT=3000
-        fi
-
-
-        # Khởi động tunnel cloudflared
-        echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
-        TUNNEL_TYPE="cloudflared"
-        cloudflared tunnel --url http://localhost:$PORT > cloudflared_output.log 2>&1 &
-        TUNNEL_PID=$!
-        
-        # Chờ URL xuất hiện, tối đa 30 giây
-        counter=0
-        MAX_WAIT=30
-        echo -e "${CYAN}${BOLD}[✓] Waiting for cloudflared URL (up to $MAX_WAIT seconds)...${NC}"
-        while [ $counter -lt $MAX_WAIT ]; do
-            CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared_output.log | head -n1)
-            if [ -n "$CLOUDFLARED_URL" ]; then
-                echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started: $CLOUDFLARED_URL${NC}"
-                
-                # Kiểm tra URL với nhiều lần thử và timeout dài hơn
-                echo -e "${CYAN}${BOLD}[✓] Checking if cloudflared URL is accessible...${NC}"
-                attempt=0
-                MAX_ATTEMPTS=5
-                while [ $attempt -lt $MAX_ATTEMPTS ]; do
-                    # Sử dụng curl với tùy chọn xử lý redirect và SSL linh hoạt
-                    if curl --output /dev/null --silent --fail --connect-timeout 30 --max-time 60 -L --retry 2 --retry-delay 2 "$CLOUDFLARED_URL"; then
-                        echo -e "${GREEN}${BOLD}[✓] Cloudflared URL is accessible: $CLOUDFLARED_URL${NC}"
-                        FORWARDING_URL="$CLOUDFLARED_URL"
-                        return 0
-                    fi
-                    echo -e "${YELLOW}${BOLD}[!] Attempt $((attempt + 1))/$MAX_ATTEMPTS: Cloudflared URL not yet accessible. Retrying...${NC}"
-                    sleep 3
-                    attempt=$((attempt + 1))
-                done
-                
-                echo -e "${RED}${BOLD}[✗] Cloudflared URL is not accessible after $MAX_ATTEMPTS attempts: $CLOUDFLARED_URL${NC}"
-                kill $TUNNEL_PID 2>/dev/null || true
-                return 1
-            fi
-            sleep 1
-            counter=$((counter + 1))
-        done
-
-        # Nếu không lấy được URL
-        echo -e "${RED}${BOLD}[✗] Failed to retrieve cloudflared URL after $MAX_WAIT seconds.${NC}"
-        echo -e "${RED}${BOLD}[✗] Check cloudflared_output.log for details:${NC}"
-        [ -f cloudflared_output.log ] && cat cloudflared_output.log
-        kill $TUNNEL_PID 2>/dev/null || true
-        return 1
-    }
-
-    get_ngrok_url_method1() {
-        local url=$(grep -o '"url":"https://[^"]*' ngrok_output.log 2>/dev/null | head -n1 | cut -d'"' -f4)
-        echo "$url"
-    }
-
-    get_ngrok_url_method2() {
-        local try_port
-        local url=""
-        for try_port in $(seq 4040 4045); do
-            local response=$(curl -s "http://localhost:$try_port/api/tunnels" 2>/dev/null)
-            if [ -n "$response" ]; then
-                url=$(echo "$response" | grep -o '"public_url":"https://[^"]*' | head -n1 | cut -d'"' -f4)
-                if [ -n "$url" ]; then
-                    break
-                fi
-            fi
-        done
-        echo "$url"
-    }
+      echo -e "\n${CYAN}${BOLD}[✓] Trying cloudflared...${NC}"
+      
+      # Khởi động tunnel cloudflared
+      echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
+      TUNNEL_TYPE="cloudflared"
+      cloudflared tunnel --url http://localhost:$PORT > cloudflared_output.log 2>&1 &
+      TUNNEL_PID=$!
+      
+      # Chờ URL xuất hiện, tối đa 30 giây
+      counter=0
+      MAX_WAIT=30
+      echo -e "${CYAN}${BOLD}[✓] Waiting for cloudflared URL (up to $MAX_WAIT seconds)...${NC}"
+      while [ $counter -lt $MAX_WAIT ]; do
+          CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared_output.log | head -n1)
+          if [ -n "$CLOUDFLARED_URL" ]; then
+              echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started: $CLOUDFLARED_URL${NC}"
+              FORWARDING_URL="$CLOUDFLARED_URL"
+              return 0
+          fi
+          sleep 1
+          counter=$((counter + 1))
+      done
+  
+      # Nếu không lấy được URL
+      echo -e "${RED}${BOLD}[✗] Failed to retrieve cloudflared URL after $MAX_WAIT seconds.${NC}"
+      echo -e "${RED}${BOLD}[✗] Check cloudflared_output.log for details:${NC}"
+      [ -f cloudflared_output.log ] && cat cloudflared_output.log
+      kill $TUNNEL_PID 2>/dev/null || true
+      return 1
+  }
+  
+      get_ngrok_url_method2() {
+          local try_port
+          local url=""
+          for try_port in $(seq 4040 4045); do
+              local response=$(curl -s "http://localhost:$try_port/api/tunnels" 2>/dev/null)
+              if [ -n "$response" ]; then
+                  url=$(echo "$response" | grep -o '"public_url":"https://[^"]*' | head -n1 | cut -d'"' -f4)
+                  if [ -n "$url" ]; then
+                      break
+                  fi
+              fi
+          done
+          echo "$url"
+      }
 
     get_ngrok_url_method3() {
         local url=$(grep -o "Forwarding.*https://[^ ]*" ngrok_output.log 2>/dev/null | grep -o "https://[^ ]*" | head -n1)
