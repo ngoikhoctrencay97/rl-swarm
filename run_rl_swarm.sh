@@ -347,7 +347,7 @@ else
         return 1
     }
 
-   try_cloudflared() {
+    try_cloudflared() {
         echo -e "\n${CYAN}${BOLD}[✓] Trying cloudflared...${NC}"
         
         # Kiểm tra và cài đặt cloudflared
@@ -363,35 +363,35 @@ else
             PORT=3000
         fi
 
+
         # Khởi động tunnel cloudflared
         echo -e "${CYAN}${BOLD}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
         TUNNEL_TYPE="cloudflared"
-        # Sử dụng tee để ghi log và hiển thị trên terminal
-        cloudflared tunnel --url "http://localhost:$PORT" 2>&1 | tee cloudflared_output.log &
+        cloudflared tunnel --url http://localhost:$PORT > cloudflared_output.log 2>&1 &
         TUNNEL_PID=$!
         
-        # Tăng thời gian chờ lên 30 giây để đảm bảo tunnel ổn định
+        # Chờ URL xuất hiện, tối đa 30 giây
         counter=0
         MAX_WAIT=30
         echo -e "${CYAN}${BOLD}[✓] Waiting for cloudflared URL (up to $MAX_WAIT seconds)...${NC}"
         while [ $counter -lt $MAX_WAIT ]; do
-            # Sử dụng regex chặt chẽ để lấy URL
             CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared_output.log | head -n1)
             if [ -n "$CLOUDFLARED_URL" ]; then
                 echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started: $CLOUDFLARED_URL${NC}"
                 
-                # Kiểm tra URL với timeout dài hơn và nhiều lần thử
+                # Kiểm tra URL với nhiều lần thử và timeout dài hơn
                 echo -e "${CYAN}${BOLD}[✓] Checking if cloudflared URL is accessible...${NC}"
                 attempt=0
-                MAX_ATTEMPTS=3
+                MAX_ATTEMPTS=5
                 while [ $attempt -lt $MAX_ATTEMPTS ]; do
-                    if curl --output /dev/null --silent --fail --connect-timeout 10 --max-time 15 "$CLOUDFLARED_URL"; then
+                    # Sử dụng curl với tùy chọn xử lý redirect và SSL linh hoạt
+                    if curl --output /dev/null --silent --fail --connect-timeout 10 --max-time 30 -L --retry 2 --retry-delay 2 "$CLOUDFLARED_URL"; then
                         echo -e "${GREEN}${BOLD}[✓] Cloudflared URL is accessible: $CLOUDFLARED_URL${NC}"
                         FORWARDING_URL="$CLOUDFLARED_URL"
                         return 0
                     fi
                     echo -e "${YELLOW}${BOLD}[!] Attempt $((attempt + 1))/$MAX_ATTEMPTS: Cloudflared URL not yet accessible. Retrying...${NC}"
-                    sleep 2
+                    sleep 3
                     attempt=$((attempt + 1))
                 done
                 
@@ -403,7 +403,7 @@ else
             counter=$((counter + 1))
         done
 
-        # Nếu hết thời gian chờ mà không lấy được URL
+        # Nếu không lấy được URL
         echo -e "${RED}${BOLD}[✗] Failed to retrieve cloudflared URL after $MAX_WAIT seconds.${NC}"
         echo -e "${RED}${BOLD}[✗] Check cloudflared_output.log for details:${NC}"
         [ -f cloudflared_output.log ] && cat cloudflared_output.log
