@@ -41,7 +41,3 @@ max_rounds: 10000
 # Model-specific arguments
 model_name_or_path: unsloth/Qwen2.5-0.5B-Instruct
 output_dir: runs/gsm8k/multinode/Qwen2.5-0.5B-Instruct-Gensyn-Swarm
-Beta
-0 / 10
-used queries
-1
