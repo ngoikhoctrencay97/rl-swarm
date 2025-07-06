@@ -247,6 +247,55 @@ install_python_deps() {
     log_info "Python dependencies installed successfully"
 }
 
+# Patch hivemind p2p daemon timeout
+patch_hivemind_timeout() {
+    log_info "Checking for hivemind p2p daemon patch..."
+    
+    # Common paths where the file might be located
+    local possible_paths=(
+        "$ROOT/.venv/lib/python3.12/site-packages/hivemind/p2p/p2p_daemon.py"
+        "$HOME/rl-swarm/.venv/lib/python3.12/site-packages/hivemind/p2p/p2p_daemon.py"
+        "$(python -c 'import hivemind; print(hivemind.__file__.replace("__init__.py", "p2p/p2p_daemon.py"))' 2>/dev/null || echo '')"
+    )
+    
+    # Try to find the file
+    local daemon_file=""
+    for path in "${possible_paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            daemon_file="$path"
+            break
+        fi
+    done
+    
+    if [[ -n "$daemon_file" ]]; then
+        log_info "Found hivemind p2p daemon file: $daemon_file"
+        
+        # Check if patch is already applied
+        if grep -q "startup_timeout: float = 120" "$daemon_file"; then
+            log_info "Timeout patch already applied"
+        else
+            log_info "Applying timeout patch (15s -> 120s)..."
+            # Create backup first
+            cp "$daemon_file" "$daemon_file.backup"
+            
+            # Apply patch
+            sed -i 's/startup_timeout: float = 15/startup_timeout: float = 120/' "$daemon_file"
+            
+            # Verify patch was applied
+            if grep -q "startup_timeout: float = 120" "$daemon_file"; then
+                log_info "Timeout patch applied successfully"
+            else
+                log_warn "Failed to apply timeout patch"
+                # Restore backup if patch failed
+                mv "$daemon_file.backup" "$daemon_file"
+            fi
+        fi
+    else
+        log_warn "Hivemind p2p daemon file not found. Patch will be skipped."
+        log_debug "Searched paths: ${possible_paths[*]}"
+    fi
+}
+
 # =============================================================================
 # Configuration Management
 # =============================================================================
@@ -300,7 +349,7 @@ display_banner() {
     ██   ██ ██                 ██ ██ ███ ██ ██   ██ ██   ██ ██  ██  ██
     ██   ██ ███████       ███████  ███ ███  ██   ██ ██   ██ ██      ██
 
-    From Gensyn - Noah Version
+    From Gensyn - Improved Version
 
 EOF
     echo -e "$RESET_TEXT"
@@ -328,6 +377,7 @@ main() {
     
     # Install dependencies
     install_python_deps
+    patch_hivemind_timeout
     setup_config
     
     # Final setup
