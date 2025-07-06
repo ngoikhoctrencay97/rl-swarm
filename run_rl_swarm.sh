@@ -2,256 +2,394 @@
 
 set -euo pipefail
 
-# General arguments
-ROOT=$PWD
+# =============================================================================
+# RL-Swarm Launcher Script - Improved Version
+# =============================================================================
 
-# GenRL Swarm version to use
-GENRL_TAG="v0.1.1"
+# Configuration
+readonly ROOT="$PWD"
+readonly GENRL_TAG="v0.1.1"
+readonly MAX_RETRIES=3
+readonly RETRY_DELAY=10
+readonly RETRY_COUNT_FILE="/tmp/rl_swarm_retry_count"
+readonly LOG_DIR="$ROOT/logs"
+readonly CONFIG_DIR="$ROOT/configs"
 
+# Environment variables with defaults
 export IDENTITY_PATH
 export GENSYN_RESET_CONFIG
 export CONNECT_TO_TESTNET=true
 export ORG_ID
-export HF_HUB_DOWNLOAD_TIMEOUT=120  # 2 minutes
+export HF_HUB_DOWNLOAD_TIMEOUT=120
 export SWARM_CONTRACT="0xFaD7C5e93f28257429569B854151A1B8DCD404c2"
 export HUGGINGFACE_ACCESS_TOKEN="None"
 
-# Path to an RSA private key. If this path does not exist, a new key pair will be created.
-# Remove this file if you want a new PeerID.
-DEFAULT_IDENTITY_PATH="$ROOT"/swarm.pem
+# Path configurations
+readonly DEFAULT_IDENTITY_PATH="$ROOT/swarm.pem"
 IDENTITY_PATH=${IDENTITY_PATH:-$DEFAULT_IDENTITY_PATH}
-
 DOCKER=${DOCKER:-""}
 GENSYN_RESET_CONFIG=${GENSYN_RESET_CONFIG:-""}
-
-# Bit of a workaround for the non-root docker container.
-if [ -n "$DOCKER" ]; then
-    volumes=(
-        /home/gensyn/rl_swarm/modal-login/temp-data
-        /home/gensyn/rl_swarm/keys
-        /home/gensyn/rl_swarm/configs
-        /home/gensyn/rl_swarm/logs
-    )
-
-    for volume in ${volumes[@]}; do
-        sudo chown -R 1001:1001 $volume
-    done
-fi
-
-# Will ignore any visible GPUs if set.
 CPU_ONLY=${CPU_ONLY:-""}
-
-# Set if successfully parsed from modal-login/temp-data/userData.json.
 ORG_ID=${ORG_ID:-""}
 
-GREEN_TEXT="\033[32m"
-BLUE_TEXT="\033[34m"
-RED_TEXT="\033[31m"
-RESET_TEXT="\033[0m"
+# Color codes
+readonly GREEN_TEXT="\033[32m"
+readonly BLUE_TEXT="\033[34m"
+readonly RED_TEXT="\033[31m"
+readonly YELLOW_TEXT="\033[33m"
+readonly RESET_TEXT="\033[0m"
 
-echo_green() {
-    echo -e "$GREEN_TEXT$1$RESET_TEXT"
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+# Logging functions
+log_info() {
+    echo -e "${GREEN_TEXT}[INFO]${RESET_TEXT} $1"
 }
 
-echo_blue() {
-    echo -e "$BLUE_TEXT$1$RESET_TEXT"
+log_warn() {
+    echo -e "${YELLOW_TEXT}[WARN]${RESET_TEXT} $1"
 }
 
-echo_red() {
-    echo -e "$RED_TEXT$1$RESET_TEXT"
+log_error() {
+    echo -e "${RED_TEXT}[ERROR]${RESET_TEXT} $1"
 }
 
-ROOT_DIR="$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)"
+log_debug() {
+    echo -e "${BLUE_TEXT}[DEBUG]${RESET_TEXT} $1"
+}
 
-# Biến đếm số lần thử lại
-MAX_RETRIES=3
-RETRY_COUNT=0
-RETRY_COUNT_FILE="/tmp/rl_swarm_retry_count"
+# Initialize directories
+init_directories() {
+    log_info "Initializing directories..."
+    
+    local directories=("$LOG_DIR" "$CONFIG_DIR")
+    
+    for dir in "${directories[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            log_info "Created directory: $dir"
+        fi
+    done
+}
 
-# Khởi tạo file đếm nếu chưa tồn tại
-if [ ! -f "$RETRY_COUNT_FILE" ]; then
-    echo 0 > "$RETRY_COUNT_FILE"
-fi
+# Initialize retry counter
+init_retry_counter() {
+    if [[ ! -f "$RETRY_COUNT_FILE" ]]; then
+        echo 0 > "$RETRY_COUNT_FILE"
+    fi
+}
 
-# Function to clean up the server process upon exit
+# Get current retry count
+get_retry_count() {
+    if [[ -f "$RETRY_COUNT_FILE" ]]; then
+        cat "$RETRY_COUNT_FILE"
+    else
+        echo 0
+    fi
+}
+
+# Reset retry counter
+reset_retry_counter() {
+    rm -f "$RETRY_COUNT_FILE"
+}
+
+# Docker volume setup
+setup_docker_volumes() {
+    if [[ -n "$DOCKER" ]]; then
+        log_info "Setting up Docker volumes..."
+        
+        local volumes=(
+            "/home/gensyn/rl_swarm/modal-login/temp-data"
+            "/home/gensyn/rl_swarm/keys"
+            "/home/gensyn/rl_swarm/configs"
+            "/home/gensyn/rl_swarm/logs"
+        )
+        
+        for volume in "${volumes[@]}"; do
+            if [[ -d "$volume" ]]; then
+                sudo chown -R 1001:1001 "$volume"
+                log_info "Set ownership for volume: $volume"
+            fi
+        done
+    fi
+}
+
+# =============================================================================
+# Node.js and Yarn Installation
+# =============================================================================
+
+install_nodejs() {
+    if ! command -v node > /dev/null 2>&1; then
+        log_info "Node.js not found. Installing NVM and latest Node.js..."
+        
+        export NVM_DIR="$HOME/.nvm"
+        if [[ ! -d "$NVM_DIR" ]]; then
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+        fi
+        
+        # Source NVM
+        [[ -s "$NVM_DIR/nvm.sh" ]] && \. "$NVM_DIR/nvm.sh"
+        [[ -s "$NVM_DIR/bash_completion" ]] && \. "$NVM_DIR/bash_completion"
+        
+        nvm install node
+        log_info "Node.js installed successfully"
+    else
+        log_info "Node.js is already installed: $(node -v)"
+    fi
+}
+
+install_yarn() {
+    if ! command -v yarn > /dev/null 2>&1; then
+        log_info "Installing Yarn..."
+        
+        # Detect OS and install accordingly
+        if grep -qi "ubuntu" /etc/os-release 2> /dev/null || uname -r | grep -qi "microsoft"; then
+            log_info "Detected Ubuntu/WSL. Installing Yarn via apt..."
+            curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
+            echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
+            sudo apt update && sudo apt install -y yarn
+        else
+            log_info "Installing Yarn globally with npm..."
+            npm install -g --silent yarn
+        fi
+        
+        log_info "Yarn installed successfully"
+    else
+        log_info "Yarn is already installed: $(yarn --version)"
+    fi
+}
+
+# =============================================================================
+# Modal Login Server Setup
+# =============================================================================
+
+setup_modal_login() {
+    log_info "Setting up modal login server..."
+    
+    cd modal-login || {
+        log_error "Failed to change to modal-login directory"
+        return 1
+    }
+    
+    # Update environment file
+    local env_file="$ROOT/modal-login/.env"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "3s/.*/SMART_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$env_file"
+    else
+        sed -i "3s/.*/SMART_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$env_file"
+    fi
+    
+    # Install dependencies and build (skip if Docker)
+    if [[ -z "$DOCKER" ]]; then
+        log_info "Installing dependencies and building server..."
+        yarn install --immutable
+        yarn build > "$LOG_DIR/yarn.log" 2>&1
+    fi
+    
+    # Start server
+    log_info "Starting modal login server..."
+    yarn start >> "$LOG_DIR/yarn.log" 2>&1 &
+    
+    local server_pid=$!
+    log_info "Started server process: $server_pid"
+    sleep 5
+    
+    # Open browser
+    if [[ -z "$DOCKER" ]]; then
+        if open http://localhost:3000 2> /dev/null; then
+            log_info "Successfully opened http://localhost:3000 in your default browser"
+        else
+            log_warn "Failed to open http://localhost:3000. Please open it manually"
+        fi
+    else
+        log_info "Please open http://localhost:3000 in your host browser"
+    fi
+    
+    cd ..
+}
+
+# Wait for user data
+wait_for_user_data() {
+    log_info "Waiting for modal userData.json to be created..."
+    
+    local user_data_file="modal-login/temp-data/userData.json"
+    while [[ ! -f "$user_data_file" ]]; do
+        sleep 5
+    done
+    
+    log_info "Found userData.json. Proceeding..."
+    
+    # Extract ORG_ID
+    ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' "$user_data_file")
+    log_info "Your ORG_ID is set to: $ORG_ID"
+    export ORG_ID
+}
+
+# Wait for API key activation
+wait_for_api_activation() {
+    log_info "Waiting for API key to become activated..."
+    
+    while true; do
+        local status
+        status=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID" 2>/dev/null || echo "error")
+        
+        if [[ "$status" == "activated" ]]; then
+            log_info "API key is activated! Proceeding..."
+            break
+        else
+            log_info "Waiting for API key to be activated..."
+            sleep 5
+        fi
+    done
+}
+
+# =============================================================================
+# Python Dependencies Installation
+# =============================================================================
+
+install_python_deps() {
+    log_info "Installing Python dependencies..."
+    
+    # Upgrade pip
+    pip install --upgrade pip
+    
+    # Install required packages
+    local packages=(
+        "gensyn-genrl==0.1.4"
+        "reasoning-gym>=0.1.20"
+        "trl"
+        "hivemind@git+https://github.com/learning-at-home/hivemind@4d5c41495be082490ea44cce4e9dd58f9926bb4e"
+    )
+    
+    for package in "${packages[@]}"; do
+        log_info "Installing $package..."
+        pip install "$package"
+    done
+    
+    log_info "Python dependencies installed successfully"
+}
+
+# =============================================================================
+# Configuration Management
+# =============================================================================
+
+setup_config() {
+    log_info "Setting up configuration..."
+    
+    local config_file="$CONFIG_DIR/rg-swarm.yaml"
+    local default_config="$ROOT/rgym_exp/config/rg-swarm.yaml"
+    
+    if [[ -f "$config_file" ]]; then
+        if ! cmp -s "$default_config" "$config_file"; then
+            if [[ -z "$GENSYN_RESET_CONFIG" ]]; then
+                log_warn "Found differences in rg-swarm.yaml. Set GENSYN_RESET_CONFIG to reset to default."
+            else
+                log_info "Backing up existing config and resetting to default..."
+                mv "$config_file" "$config_file.bak"
+                cp "$default_config" "$config_file"
+            fi
+        fi
+    else
+        log_info "Copying default configuration..."
+        cp "$default_config" "$config_file"
+    fi
+    
+    # Set permissions for Docker
+    if [[ -n "$DOCKER" ]]; then
+        sudo chmod -R 0777 "$CONFIG_DIR"
+    fi
+}
+
+# =============================================================================
+# Error Handling and Cleanup
+# =============================================================================
+
 cleanup() {
-    echo_green ">> Shutting down trainer..."
+    log_info "Shutting down trainer..."
+    reset_retry_counter
     exit 0
 }
 
-errnotify() {
-    RETRY_COUNT=$(cat "$RETRY_COUNT_FILE")
-    ((RETRY_COUNT++))
-    echo $RETRY_COUNT > "$RETRY_COUNT_FILE"
+handle_error() {
+    local retry_count
+    retry_count=$(get_retry_count)
+    ((retry_count++))
+    echo $retry_count > "$RETRY_COUNT_FILE"
     
-    echo_red ">> An error was detected while running rl-swarm (Attempt $RETRY_COUNT/$MAX_RETRIES). See logs for details."
+    log_error "An error was detected while running rl-swarm (Attempt $retry_count/$MAX_RETRIES)"
     
-    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-        echo_green ">> Retrying run_rl_swarm.sh..."
-        sleep 10  # Đợi 5 giây trước khi chạy lại
+    if [[ $retry_count -lt $MAX_RETRIES ]]; then
+        log_info "Retrying ./run_rl_swarm.sh in $RETRY_DELAY seconds..."
+        sleep $RETRY_DELAY
         exec ./run_rl_swarm.sh
     else
-        echo_red ">> Maximum retries ($MAX_RETRIES) reached. Exiting."
-        rm -f "$RETRY_COUNT_FILE"  # Xóa file đếm khi đạt giới hạn
+        log_error "Maximum retries ($MAX_RETRIES) reached. Exiting."
+        reset_retry_counter
         exit 1
     fi
 }
 
-trap cleanup EXIT
-trap errnotify ERR
+# =============================================================================
+# Main Execution
+# =============================================================================
 
-echo -e "\033[38;5;224m"
-cat << "EOF"
+display_banner() {
+    echo -e "\033[38;5;224m"
+    cat << "EOF"
     ██████  ██            ███████ ██     ██  █████  ██████  ███    ███
     ██   ██ ██            ██      ██     ██ ██   ██ ██   ██ ████  ████
     ██████  ██      █████ ███████ ██  █  ██ ███████ ██████  ██ ████ ██
     ██   ██ ██                 ██ ██ ███ ██ ██   ██ ██   ██ ██  ██  ██
     ██   ██ ███████       ███████  ███ ███  ██   ██ ██   ██ ██      ██
 
-    From Gensyn
+    From Gensyn - Improved Version
 
 EOF
+    echo -e "$RESET_TEXT"
+}
 
-# Create logs directory if it doesn't exist
-mkdir -p "$ROOT/logs"
-
-if [ "$CONNECT_TO_TESTNET" = true ]; then
-    # Run modal_login server.
-    echo "Please login to create an Ethereum Server Wallet"
-    cd modal-login
-    # Check if the yarn command exists; if not, install Yarn.
-
-    # Node.js + NVM setup
-    if ! command -v node > /dev/null 2>&1; then
-        echo "Node.js not found. Installing NVM and latest Node.js..."
-        export NVM_DIR="$HOME/.nvm"
-        if [ ! -d "$NVM_DIR" ]; then
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-        fi
-        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-        nvm install node
-    else
-        echo "Node.js is already installed: $(node -v)"
+main() {
+    # Set up traps
+    trap cleanup EXIT
+    trap 'handle_error "$@"' ERR
+    
+    # Initialize
+    display_banner
+    init_directories
+    init_retry_counter
+    setup_docker_volumes
+    
+    # Testnet connection setup
+    if [[ "$CONNECT_TO_TESTNET" == "true" ]]; then
+        log_info "Setting up testnet connection..."
+        
+        install_nodejs
+        install_yarn
+        setup_modal_login
+        wait_for_user_data
+        wait_for_api_activation
     fi
+    
+    # Install dependencies
+    install_python_deps
+    setup_config
+    
+    # Final setup
+    log_info "Configuration complete!"
+    log_info "Good luck in the swarm!"
+    log_debug "Remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
+    
+    # Launch the swarm
+    log_info "Launching RL-Swarm..."
+    python -m rgym_exp.runner.swarm_launcher \
+        --config-path "$ROOT/rgym_exp/config" \
+        --config-name "rg-swarm.yaml"
+    
+    # Keep script running
+    wait
+}
 
-    if ! command -v yarn > /dev/null 2>&1; then
-        # Detect Ubuntu (including WSL Ubuntu) and install Yarn accordingly
-        if grep -qi "ubuntu" /etc/os-release 2> /dev/null || uname -r | grep -qi "microsoft"; then
-            echo "Detected Ubuntu or WSL Ubuntu. Installing Yarn via apt..."
-            curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
-            echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
-            sudo apt update && sudo apt install -y yarn
-        else
-            echo "Yarn not found. Installing Yarn globally with npm (no profile edits)…"
-            # This lands in $NVM_DIR/versions/node/<ver>/bin which is already on PATH
-            npm install -g --silent yarn
-        fi
-    fi
-
-    ENV_FILE="$ROOT"/modal-login/.env
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS version
-        sed -i '' "3s/.*/SMART_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$ENV_FILE"
-    else
-        # Linux version
-        sed -i "3s/.*/SMART_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$ENV_FILE"
-    fi
-
-
-    # Docker image already builds it, no need to again.
-    if [ -z "$DOCKER" ]; then
-        yarn install --immutable
-        echo "Building server"
-        yarn build > "$ROOT/logs/yarn.log" 2>&1
-    fi
-    yarn start >> "$ROOT/logs/yarn.log" 2>&1 & # Run in background and log output
-
-    SERVER_PID=$!  # Store the process ID
-    echo "Started server process: $SERVER_PID"
-    sleep 5
-
-    # Try to open the URL in the default browser
-    if [ -z "$DOCKER" ]; then
-        if open http://localhost:3000 2> /dev/null; then
-            echo_green ">> Successfully opened http://localhost:3000 in your default browser."
-        else
-            echo ">> Failed to open http://localhost:3000. Please open it manually."
-        fi
-    else
-        echo_green ">> Please open http://localhost:3000 in your host browser."
-    fi
-
-    cd ..
-
-    echo_green ">> Waiting for modal userData.json to be created..."
-    while [ ! -f "modal-login/temp-data/userData.json" ]; do
-        sleep 5  # Wait for 5 seconds before checking again
-    done
-    echo "Found userData.json. Proceeding..."
-
-    ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' modal-login/temp-data/userData.json)
-    echo "Your ORG_ID is set to: $ORG_ID"
-
-    # Wait until the API key is activated by the client
-    echo "Waiting for API key to become activated..."
-    while true; do
-        STATUS=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID")
-        if [[ "$STATUS" == "activated" ]]; then
-            echo "API key is activated! Proceeding..."
-            break
-        else
-            echo "Waiting for API key to be activated..."
-            sleep 5
-        fi
-    done
-fi
-
-echo_green ">> Getting requirements..."
-pip install --upgrade pip
-
-# echo_green ">> Installing GenRL..."
-pip install gensyn-genrl==0.1.4
-pip install reasoning-gym>=0.1.20 # for reasoning gym env
-pip install trl # for grpo config, will be deprecated soon
-pip install hivemind@git+https://github.com/learning-at-home/hivemind@4d5c41495be082490ea44cce4e9dd58f9926bb4e # We need the latest, 1.1.11 is broken
-
-
-if [ ! -d "$ROOT/configs" ]; then
-    mkdir "$ROOT/configs"
-fi  
-if [ -f "$ROOT/configs/rg-swarm.yaml" ]; then
-    # Use cmp -s for a silent comparison. If different, backup and copy.
-    if ! cmp -s "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"; then
-        if [ -z "$GENSYN_RESET_CONFIG" ]; then
-            echo_green ">> Found differences in rg-swarm.yaml. If you would like to reset to the default, set GENSYN_RESET_CONFIG to a non-empty value."
-        else
-            echo_green ">> Found differences in rg-swarm.yaml. Backing up existing config."
-            mv "$ROOT/configs/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml.bak"
-            cp "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"
-        fi
-    fi
-else
-    # If the config doesn't exist, just copy it.
-    cp "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"
-fi
-
-if [ -n "$DOCKER" ]; then
-    # Make it easier to edit the configs on Linux systems.
-    sudo chmod -R 0777 /home/gensyn/rl_swarm/configs
-fi
-
-echo_green ">> Done!"
-
-HUGGINGFACE_ACCESS_TOKEN="None"
-echo_green ">> Skipping Hugging Face upload (set to 'None' by default)."
-
-
-echo_green ">> Good luck in the swarm!"
-echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
-
-python -m rgym_exp.runner.swarm_launcher \
-    --config-path "$ROOT/rgym_exp/config" \
-    --config-name "rg-swarm.yaml" 
-
-wait  # Keep script running until Ctrl+C
+# Execute main function
+main "$@"
