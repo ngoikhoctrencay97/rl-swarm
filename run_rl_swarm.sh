@@ -63,6 +63,16 @@ echo_red() {
 
 ROOT_DIR="$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)"
 
+# Biến đếm số lần thử lại
+MAX_RETRIES=3
+RETRY_COUNT=0
+RETRY_COUNT_FILE="/tmp/rl_swarm_retry_count"
+
+# Khởi tạo file đếm nếu chưa tồn tại
+if [ ! -f "$RETRY_COUNT_FILE" ]; then
+    echo 0 > "$RETRY_COUNT_FILE"
+fi
+
 # Function to clean up the server process upon exit
 cleanup() {
     echo_green ">> Shutting down trainer..."
@@ -70,7 +80,21 @@ cleanup() {
 }
 
 errnotify() {
-    echo_red ">> An error was detected while running rl-swarm. See $ROOT/logs for full logs."
+    RETRY_COUNT=$(cat "$RETRY_COUNT_FILE")
+    ((RETRY_COUNT++))
+    echo $RETRY_COUNT > "$RETRY_COUNT_FILE"
+    
+    echo_red ">> An error was detected while running rl-swarm (Attempt $RETRY_COUNT/$MAX_RETRIES). See logs for details."
+    
+    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+        echo_green ">> Retrying run_rl_swarm.sh..."
+        sleep 10  # Đợi 5 giây trước khi chạy lại
+        exec ./run_rl_swarm.sh
+    else
+        echo_red ">> Maximum retries ($MAX_RETRIES) reached. Exiting."
+        rm -f "$RETRY_COUNT_FILE"  # Xóa file đếm khi đạt giới hạn
+        exit 1
+    fi
 }
 
 trap cleanup EXIT
@@ -219,32 +243,9 @@ fi
 
 echo_green ">> Done!"
 
-HF_TOKEN=${HF_TOKEN:-""}
-if [ -n "${HF_TOKEN}" ]; then # Check if HF_TOKEN is already set and use if so. Else give user a prompt to choose.
-    HUGGINGFACE_ACCESS_TOKEN=${HF_TOKEN}
-else
-    echo -en $GREEN_TEXT
-    read -p ">> Would you like to push models you train in the RL swarm to the Hugging Face Hub? [y/N] " yn
-    echo -en $RESET_TEXT
-    yn=${yn:-N} # Default to "N" if the user presses Enter
-    case $yn in
-        [Yy]*) read -p "Enter your Hugging Face access token: " HUGGINGFACE_ACCESS_TOKEN ;;
-        [Nn]*) HUGGINGFACE_ACCESS_TOKEN="None" ;;
-        *) echo ">>> No answer was given, so NO models will be pushed to Hugging Face Hub" && HUGGINGFACE_ACCESS_TOKEN="None" ;;
-    esac
-fi
+HUGGINGFACE_ACCESS_TOKEN="None"
+echo_green ">> Skipping Hugging Face upload (set to 'None' by default)."
 
-echo -en $GREEN_TEXT
-read -p ">> Enter the name of the model you want to use in huggingface repo/name format, or press [Enter] to use the default model. " MODEL_NAME
-echo -en $RESET_TEXT
-
-# Only export MODEL_NAME if user provided a non-empty value
-if [ -n "$MODEL_NAME" ]; then
-    export MODEL_NAME
-    echo_green ">> Using model: $MODEL_NAME"
-else
-    echo_green ">> Using default model from config"
-fi
 
 echo_green ">> Good luck in the swarm!"
 echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
