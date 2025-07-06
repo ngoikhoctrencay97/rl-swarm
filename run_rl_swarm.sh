@@ -9,9 +9,6 @@ set -euo pipefail
 # Configuration
 readonly ROOT="$PWD"
 readonly GENRL_TAG="v0.1.1"
-readonly MAX_RETRIES=3
-readonly RETRY_DELAY=10
-readonly RETRY_COUNT_FILE="/tmp/rl_swarm_retry_count"
 readonly LOG_DIR="$ROOT/logs"
 readonly CONFIG_DIR="$ROOT/configs"
 
@@ -72,27 +69,6 @@ init_directories() {
             log_info "Created directory: $dir"
         fi
     done
-}
-
-# Initialize retry counter
-init_retry_counter() {
-    if [[ ! -f "$RETRY_COUNT_FILE" ]]; then
-        echo 0 > "$RETRY_COUNT_FILE"
-    fi
-}
-
-# Get current retry count
-get_retry_count() {
-    if [[ -f "$RETRY_COUNT_FILE" ]]; then
-        cat "$RETRY_COUNT_FILE"
-    else
-        echo 0
-    fi
-}
-
-# Reset retry counter
-reset_retry_counter() {
-    rm -f "$RETRY_COUNT_FILE"
 }
 
 # Docker volume setup
@@ -308,27 +284,7 @@ setup_config() {
 
 cleanup() {
     log_info "Shutting down trainer..."
-    reset_retry_counter
     exit 0
-}
-
-handle_error() {
-    local retry_count
-    retry_count=$(get_retry_count)
-    ((retry_count++))
-    echo $retry_count > "$RETRY_COUNT_FILE"
-    
-    log_error "An error was detected while running rl-swarm (Attempt $retry_count/$MAX_RETRIES)"
-    
-    if [[ $retry_count -lt $MAX_RETRIES ]]; then
-        log_info "Retrying ./run_rl_swarm.sh in $RETRY_DELAY seconds..."
-        sleep $RETRY_DELAY
-        exec ./run_rl_swarm.sh
-    else
-        log_error "Maximum retries ($MAX_RETRIES) reached. Exiting."
-        reset_retry_counter
-        exit 1
-    fi
 }
 
 # =============================================================================
@@ -344,21 +300,19 @@ display_banner() {
     ██   ██ ██                 ██ ██ ███ ██ ██   ██ ██   ██ ██  ██  ██
     ██   ██ ███████       ███████  ███ ███  ██   ██ ██   ██ ██      ██
 
-    From Gensyn - Improved Version
+    From Gensyn - Noah Version
 
 EOF
     echo -e "$RESET_TEXT"
 }
 
 main() {
-    # Set up traps
+    # Set up trap for cleanup
     trap cleanup EXIT
-    trap 'handle_error "$@"' ERR
     
     # Initialize
     display_banner
     init_directories
-    init_retry_counter
     setup_docker_volumes
     
     # Testnet connection setup
