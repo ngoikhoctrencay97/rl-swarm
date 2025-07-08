@@ -473,11 +473,40 @@ setup_config() {
 # Error Handling and Cleanup
 # =============================================================================
 
+# Handle interruption signals
+handle_interrupt() {
+    log_warn "Received interrupt signal (Ctrl+C or similar)..."
+    cleanup
+}
+
+# Handle critical errors
+handle_critical_error() {
+    log_error "Critical error detected. Shutting down..."
+    cleanup
+}
+
 cleanup() {
     log_info "Shutting down trainer..."
     cleanup_cloudflared
     cleanup_server
     exit 0
+}
+
+# Check for critical errors in logs
+check_for_critical_errors() {
+    local log_file="$1"
+    
+    # Check for WandB errors
+    if grep -q "wandb:" "$log_file" 2>/dev/null; then
+        log_error "WandB error detected in logs"
+        handle_critical_error
+    fi
+    
+    # Check for other critical errors
+    if grep -qE "(CUDA out of memory|RuntimeError|KeyboardInterrupt|Exception)" "$log_file" 2>/dev/null; then
+        log_error "Critical runtime error detected"
+        handle_critical_error
+    fi
 }
 
 # =============================================================================
@@ -500,7 +529,8 @@ EOF
 }
 
 main() {
-    # Set up trap for cleanup
+    # Set up trap for cleanup and interrupt handling
+    trap handle_interrupt SIGINT SIGTERM
     trap cleanup EXIT
     
     # Initialize
@@ -529,14 +559,36 @@ main() {
     log_info "Good luck in the swarm!"
     log_debug "Remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
     
-    # Launch the swarm
+    # Launch the swarm with error monitoring
     log_info "Launching RL-Swarm..."
+    
+    # Create a log file for monitoring
+    local swarm_log="$LOG_DIR/swarm_runner.log"
+    
+    # Run the swarm launcher with output to both console and log file
     python -m rgym_exp.runner.swarm_launcher \
         --config-path "$ROOT/rgym_exp/config" \
-        --config-name "rg-swarm.yaml"
+        --config-name "rg-swarm.yaml" 2>&1 | tee "$swarm_log" &
     
-    # Keep script running
-    wait
+    local swarm_pid=$!
+    log_info "Swarm launcher started with PID: $swarm_pid"
+    
+    # Monitor for critical errors
+    while kill -0 $swarm_pid 2>/dev/null; do
+        sleep 5
+        check_for_critical_errors "$swarm_log"
+    done
+    
+    # Wait for the swarm process to complete
+    wait $swarm_pid
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Swarm launcher exited with error code: $exit_code"
+        handle_critical_error
+    fi
+    
+    log_info "Swarm launcher completed successfully"
 }
 
 # Execute main function
