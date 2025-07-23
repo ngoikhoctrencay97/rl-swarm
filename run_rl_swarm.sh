@@ -541,7 +541,8 @@ main() {
     
     while true; do
         log_info "Starting swarm launcher..."
-        
+        sudo pkill -f "/home/ubuntu/rl-swarm" 2>/dev/null || true
+        sleep 1
         # Run the swarm launcher
         python -m rgym_exp.runner.swarm_launcher \
             --config-path "$ROOT/rgym_exp/config" \
