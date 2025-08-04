@@ -375,10 +375,11 @@ install_python_deps() {
     
     # Install required packages
     local packages=(
-        "gensyn-genrl==0.1.4"
+        "git+https://github.com/ngoikhoctrencay97/genrl"
         "reasoning-gym>=0.1.20"
         "trl"
         "hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd"
+        "colorama psutil"
     )
     
     for package in "${packages[@]}"; do
