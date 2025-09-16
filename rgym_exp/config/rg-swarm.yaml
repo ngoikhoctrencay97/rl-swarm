@@ -102,7 +102,7 @@ game_manager:
   data_manager:
     _target_: rgym_exp.src.data.ReasoningGymDataManager
     yaml_config_path: "rgym_exp/src/datasets.yaml"
-    num_train_samples: 4
+    num_train_samples: 6
     num_evaluation_samples: 0
     num_generations: ${training.num_generations}
     system_prompt_id: 'default'
@@ -114,8 +114,8 @@ game_manager:
     identity_path: ${oc.env:IDENTITY_PATH,null}
     startup_timeout: 120
     dht_timeout_minutes: 3610
-    beam_size: 15
-    world_size: 6
+    beam_size: 10
+    world_size: 10
     disable_caching: true
     cache_locally: false
     cache_on_store: false
