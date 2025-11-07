@@ -8,7 +8,7 @@
 
 # Configuration
 readonly ROOT="$PWD"
-readonly GENRL_TAG="0.1.6"
+readonly GENRL_TAG="0.1.11"
 readonly LOG_DIR="$ROOT/logs"
 readonly CONFIG_DIR="$ROOT/configs"
 
@@ -422,7 +422,7 @@ install_python_deps() {
     
     # Install required packages
     local packages=(
-        #"gensyn-genrl==${GENRL_TAG}"
+        "gensyn-genrl==${GENRL_TAG}"
         "reasoning-gym>=0.1.20"
         "hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd"
     )
@@ -431,7 +431,7 @@ install_python_deps() {
         log_info "Installing $package..."
         pip install "$package"
     done
-    pip install git+https://github.com/ngoikhoctrencay97/genrl.git
+    #pip install git+https://github.com/ngoikhoctrencay97/genrl.git
     pip install bitsandbytes accelerate
     pip install colorama
     log_info "Python dependencies installed successfully"
