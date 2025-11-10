@@ -1,6 +1,8 @@
 from typing import Any, Optional, List
-
+import gc
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
 from genrl.data import DataManager
 from genrl.logging_utils.global_defs import get_logger
 from genrl.logging_utils.ml_logger import LoggerMixin
@@ -11,18 +13,6 @@ from reasoning_gym.utils import SYSTEM_PROMPTS
 from rgym_exp.src.utils.judge_client import JudgeClient
 from rgym_exp.src.prg_module import PRGGameStatus
 
-# Added imports for BitsAndBytes quantization
-try:
-    from transformers import (
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        BitsAndBytesConfig,
-    )
-except Exception:
-    # If transformers not available at import time, user environment will raise when used.
-    AutoModelForCausalLM = None
-    AutoTokenizer = None
-    BitsAndBytesConfig = None
 
 PRG_SYSTEM_PROMPT = """Given a question, hints, and possible answers, your task is to answer the question by thinking step-by-step in a clear and specific manner for 1 line only.
 Your answer MUST be one of the possible answers. Provide the answer in the following format:
@@ -36,122 +26,169 @@ Your answer MUST be one of the possible answers. Give your answer in the followi
 Do not explain your reasoning at all, provide only the final answer in the answer tag.
 """
 
+
 class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method.
     Implements the TrainerModule interface defined in base_trainer.py.
-
-    Supports optional loading of a quantized model via BitsAndBytes (8/4-bit).
-    Pass kwargs like:
-        use_bnb=True,
-        bnb_4bit=True,
-        bnb_quant_type="nf4",
-        bnb_compute_dtype=torch.float16,
-        device_map="auto",
-        tokenizer_name_or_path=None
-    Or pass `models` as [<model_name_or_path>] to let the trainer load the model.
+    With 4-bit quantization support for memory efficiency.
     """
 
     def __init__(self, models: List[Any], **kwargs):
         """
-        Initialize the GRPO trainer module.
+        Initialize the GRPO trainer module with 4-bit quantization support.
 
         Args:
-            models: List containing either a loaded model object or a string model path/name.
+            models: List containing the model to be trained.
             **kwargs: Additional arguments for configuration.
         """
+        # Check and fix quantization for existing models
+        if models:
+            for i, model in enumerate(models):
+                is_quantized = self._is_model_quantized(model)
+                
+                if not is_quantized:
+                    get_logger().warning(f"Model {i} is not quantized, reloading with 4-bit quantization...")
+                    try:
+                        models[i] = self._reload_with_quantization(model, kwargs)
+                        get_logger().info(f"Model {i} successfully quantized to 4-bit")
+                    except Exception as e:
+                        get_logger().error(f"Failed to reload model {i} with quantization: {e}")
+
+        # Fallback: load model with quantization if no models provided
+        if not models:
+            model_id = kwargs.get("model_id", "Qwen/Qwen2.5-3B-Instruct")
+            get_logger().info(f"Loading model {model_id} with 4-bit quantization...")
+            
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16
+            )
+            
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+                
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16
+            )
+            models = [model]
+            self.tokenizer = tokenizer
+            get_logger().info(f"Model loaded successfully with 4-bit quantization")
+        
         super().__init__(models, **kwargs)
         judge_base_url = kwargs.get("judge_base_url", None)
         self.judge_client = JudgeClient(judge_base_url) if judge_base_url else None
 
-        # BitsAndBytes / quantization config
-        self.use_bnb = kwargs.get("use_bnb", True)  # default True; set False to disable
-        self.bnb_4bit = kwargs.get("bnb_4bit", True)
-        self.bnb_quant_type = kwargs.get("bnb_quant_type", "nf4")  # "nf4" or "fp4" etc.
-        self.bnb_compute_dtype = kwargs.get("bnb_compute_dtype", torch.float16)
-        self.device_map = kwargs.get("device_map", "auto")
-        self.tokenizer_name_or_path = kwargs.get("tokenizer_name_or_path", None)
-
-        # If models[0] is a string path, load tokenizer/model with bnb
-        first = models[0] if models else None
-        if isinstance(first, str):
-            model_name = first
-            tokenizer_name = self.tokenizer_name_or_path or model_name
-            self.model, self.tokenizer = self._load_model_and_tokenizer(
-                model_name,
-                tokenizer_name,
-            )
-            # set processing_class tokenizer if needed (some frameworks expect .tokenizer attr)
-            if hasattr(self, "processing_class") and getattr(self.processing_class, "tokenizer", None) is None:
-                try:
-                    self.processing_class.tokenizer = self.tokenizer
-                except Exception:
-                    pass
-            # keep reference for name_or_path checks used elsewhere
-            self.model.name_or_path = model_name
-        else:
-            # assume user passed already loaded model object and maybe tokenizer
-            self.model = first
-            # try to get tokenizer from kwargs
-            self.tokenizer = kwargs.get("tokenizer", None)
-
-        # configure generation kwargs safe defaults
-        self.generation_kwargs = kwargs.get("generation_kwargs", {"max_new_tokens": 512, "do_sample": False})
-
-    def _load_model_and_tokenizer(self, model_name: str, tokenizer_name: Optional[str] = None):
+    def _is_model_quantized(self, model) -> bool:
         """
-        Load tokenizer + model with BitsAndBytes quantization if requested.
-        Returns (model, tokenizer).
+        Check if model is quantized.
+        
+        Args:
+            model: The model to check
+            
+        Returns:
+            bool: True if model is quantized, False otherwise
         """
-        tokenizer_name = tokenizer_name or model_name
-        if AutoTokenizer is None or AutoModelForCausalLM is None:
-            raise RuntimeError("transformers is required for BitsAndBytes loading. Install 'transformers' and 'bitsandbytes'.")
+        # Check BnB attributes
+        if hasattr(model, 'is_quantized') and model.is_quantized:
+            return True
+        if hasattr(model, 'is_loaded_in_4bit') and model.is_loaded_in_4bit:
+            return True
+        
+        # Check quantization config
+        if (hasattr(model, 'config') and 
+            hasattr(model.config, 'quantization_config') and 
+            model.config.quantization_config is not None):
+            qconfig = model.config.quantization_config
+            if hasattr(qconfig, 'load_in_4bit') and qconfig.load_in_4bit:
+                return True
+        
+        # Check parameter dtypes (quantized models have int/uint params)
+        int_params = 0
+        total_params = 0
+        for param in model.parameters():
+            total_params += param.numel()
+            if 'int' in str(param.dtype).lower():
+                int_params += param.numel()
+        
+        return total_params > 0 and int_params / total_params > 0.1
 
-        # load tokenizer (fast)
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    def _reload_with_quantization(self, model, kwargs):
+        """
+        Reload model with 4-bit quantization.
+        
+        Args:
+            model: The model to reload
+            kwargs: Configuration arguments
+            
+        Returns:
+            The quantized model
+        """
+        model_name = getattr(model, 'name_or_path', kwargs.get("model_id", "Qwen/Qwen2.5-3B-Instruct"))
+        
+        get_logger().info(f"Reloading model {model_name} with 4-bit quantization...")
+        
+        # Clear GPU memory
+        if hasattr(model, 'cpu'):
+            model.cpu()
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Create quantization config
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+        
+        # Reload with quantization
+        new_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16
+        )
+        
+        get_logger().info(f"Model {model_name} reloaded with 4-bit quantization")
+        return new_model
 
-        if not self.use_bnb:
-            model = AutoModelForCausalLM.from_pretrained(model_name, device_map=self.device_map)
-            return model, tokenizer
+    def _smart_cache_clear(self):
+        """Clear cache only when memory usage is high"""
+        if torch.cuda.is_available():
+            allocated_gb = torch.cuda.memory_allocated() / 1024**3
+            if allocated_gb > 5.5:
+                torch.cuda.empty_cache()
+                get_logger().debug(f"Cache cleared - Memory allocated: {allocated_gb:.2f} GB")
 
-        # Build BitsAndBytesConfig for 4-bit or 8-bit
-        if self.bnb_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type=self.bnb_quant_type,
-                bnb_4bit_compute_dtype=self.bnb_compute_dtype,
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map=self.device_map,
-                quantization_config=bnb_config,
-                trust_remote_code=True,
-            )
-        else:
-            # 8-bit loading (load_in_8bit)
-            bnb_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                bnb_8bit_compute_dtype=self.bnb_compute_dtype,
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map=self.device_map,
-                quantization_config=bnb_config,
-                trust_remote_code=True,
-            )
-
-        # move to device if device_map not used
-        try:
-            if isinstance(self.device_map, str) and self.device_map == "auto":
-                pass  # device_map managed by accelerate
-            else:
-                # if single device specified
-                device = torch.device(self.device_map if isinstance(self.device_map, str) else "cpu")
-                model.to(device)
-        except Exception:
+    def _initialize_model(self, enable_gradient_checkpointing: bool = False):
+        """
+        Override to handle quantized models properly.
+        Quantized models should not have dtype cast applied.
+        
+        Args:
+            enable_gradient_checkpointing: Whether to enable gradient checkpointing
+        """
+        is_quantized = self._is_model_quantized(self.model)
+        
+        if is_quantized:
+            get_logger().info("Model is quantized - skipping dtype casting")
+            # For quantized models, don't cast dtype
             pass
-
-        return model, tokenizer
+        else:
+            get_logger().info(f"Moving model to device={self.device}, dtype={self.dtype}")
+            self.model = self.model.to(device=self.device, dtype=self.dtype)
+        
+        if enable_gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            get_logger().info("Gradient checkpointing enabled")
 
     @torch.no_grad()
     def evaluate(
@@ -187,21 +224,14 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             return_tensors="pt",
         )
 
-        # ensure device
-        device = self.model.device if hasattr(self.model, "device") else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-        input_ids = input_ids.to(device)
-
-        # If tokenizer is available for decode
-        gen_kwargs = dict(self.generation_kwargs)
-        gen_kwargs.setdefault("max_new_tokens", 512)
-
-        # Use autocast for fp16 compute when available & desired
-        use_autocast = (torch.cuda.is_available() and self.bnb_compute_dtype == torch.float16)
-        with torch.cuda.amp.autocast(enabled=use_autocast):
-            outputs = self.model.generate(input_ids, **gen_kwargs)
-
-        # decode
-        answer = self.processing_class.decode(outputs[0], skip_special_tokens=True)
+        input_ids = input_ids.to(self.model.device)
+        outputs = self.model.generate(input_ids, max_new_tokens=512)
+        answer = self.processing_class.decode(
+            outputs[0], skip_special_tokens=True
+        )
+        
+        # Clear cache after generation
+        self._smart_cache_clear()
         
         # Submit answer to judge service
         self.judge_client.submit_answer(
@@ -258,15 +288,17 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
                 return_tensors="pt",
             )
 
-            # ensure device
-            device = self.model.device if hasattr(self.model, "device") else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-            input_ids = input_ids.to(device)
+            input_ids = input_ids.to(self.model.device)
             
             # Get logits for each choice
             choice_logits = self._get_choice_logits(input_ids, choices)
             
             # Select the choice with highest probability
             choice_idx = torch.argmax(choice_logits).item()
+            
+            # Clear cache after computation
+            torch.cuda.empty_cache()
+            
             return {
                 "game_idx": game_id,
                 "clue_idx": clue_id,
@@ -285,43 +317,31 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         Returns a tensor of shape (len(choices),) giving, for each choice,
         the sum of log-probabilities that the model assigns to generating
         "<answer>{choice}</answer>" after the given input_ids.
-
-        Works with quantized models loaded via BitsAndBytes.
         """
+
         device = input_ids.device
         batch_size, prompt_len = input_ids.shape
         logits_list = []
 
-        # Use autocast if compute dtype suggests float16
-        use_autocast = (torch.cuda.is_available() and self.bnb_compute_dtype == torch.float16)
-
         for choice in choices:
             # 1) build the full token sequence: prompt + "<answer>…</answer>"
             answer_str = f"<answer>{choice}</answer>"
-            # If we have tokenizer from loading stage, use it; otherwise use processing_class
-            if getattr(self, "tokenizer", None) is not None:
-                choice_ids = self.tokenizer(answer_str, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-            else:
-                choice_ids = self.processing_class(
-                    answer_str,
-                    return_tensors="pt",
-                    add_special_tokens=False
-                ).input_ids.to(device)    # shape (1, L)
+            choice_ids = self.processing_class(
+                answer_str,
+                return_tensors="pt",
+                add_special_tokens=False
+            ).input_ids.to(device)    # shape (1, L)
 
             seq = torch.cat([input_ids, choice_ids], dim=1)  # (1, prompt_len + L)
 
             # build labels that only include the answer positions
             labels = seq.clone()
             labels[:, :prompt_len] = -100  # ignore prompt positions in loss
-
-            # forward pass — for quantized models, still works with labels
-            with torch.cuda.amp.autocast(enabled=use_autocast):
-                outputs = self.model(input_ids=seq, labels=labels)
-
+            outputs = self.model(input_ids=seq, labels=labels)
             # outputs.loss is average negative log-likelihood over the L answer tokens
-            # convert to total log-prob (sum of log-probs across tokens)
+
             total_log_prob = -outputs.loss * choice_ids.size(1)
-            logits_list.append(total_log_prob.detach().to("cpu"))
+            logits_list.append(total_log_prob)
 
         # stack into a single tensor of shape (num_choices,)
-        return torch.stack(logits_list).squeeze()
+        return torch.stack(logits_list)
