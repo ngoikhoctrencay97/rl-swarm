@@ -138,21 +138,59 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         """
         CRITICAL OVERRIDE: This is the method genrl.trainer.grpo_trainer calls!
         We must intercept it here to prevent sampling errors.
+        
+        Args:
+            prompts: Can be a Dataset, list of dicts, or tensor
         """
-        print(f"[GRPOTrainerModule] generate() called with {len(prompts)} prompts")
+        print(f"[GRPOTrainerModule] generate() called, type: {type(prompts)}")
+        
+        # Handle different input types
+        if not isinstance(prompts, (list, tuple, torch.Tensor)):
+            # It's a Dataset or similar iterable
+            try:
+                # Try to get the actual prompts data
+                if hasattr(prompts, 'data'):
+                    prompts = prompts.data
+                elif hasattr(prompts, 'dataset'):
+                    prompts = prompts.dataset
+                elif hasattr(prompts, '__iter__'):
+                    # Convert to list
+                    prompts = list(prompts)
+                else:
+                    raise TypeError(f"Cannot process prompts of type {type(prompts)}")
+            except Exception as e:
+                print(f"[GRPOTrainerModule] Error extracting prompts: {e}", file=sys.stderr)
+                print(traceback.format_exc(), file=sys.stderr)
+                raise
+        
+        print(f"[GRPOTrainerModule] Processing {len(prompts) if hasattr(prompts, '__len__') else '?'} prompts")
         
         # Get input_ids from prompts
-        if isinstance(prompts, list):
-            # Prompts are chat messages
+        if isinstance(prompts, (list, tuple)):
+            # Prompts are chat messages or already processed
             input_ids_list = []
             for prompt in prompts:
-                ids = self.processing_class.apply_chat_template(
-                    prompt,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_tensors="pt"
-                )
-                input_ids_list.append(ids)
+                # Check if already tokenized
+                if isinstance(prompt, torch.Tensor):
+                    input_ids_list.append(prompt.unsqueeze(0) if prompt.dim() == 1 else prompt)
+                elif isinstance(prompt, dict):
+                    # Chat format
+                    ids = self.processing_class.apply_chat_template(
+                        prompt if isinstance(prompt, list) else [prompt],
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        return_tensors="pt"
+                    )
+                    input_ids_list.append(ids)
+                else:
+                    # Assume it's a message list
+                    ids = self.processing_class.apply_chat_template(
+                        prompt,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        return_tensors="pt"
+                    )
+                    input_ids_list.append(ids)
             
             # Pad to same length
             max_len = max(ids.shape[1] for ids in input_ids_list)
@@ -167,8 +205,10 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
                     padded.append(ids)
             
             input_ids = torch.cat(padded, dim=0)
-        else:
+        elif isinstance(prompts, torch.Tensor):
             input_ids = prompts
+        else:
+            raise TypeError(f"Unsupported prompts type: {type(prompts)}")
 
         # Move to device
         device = self.model.device
