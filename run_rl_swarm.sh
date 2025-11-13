@@ -419,7 +419,6 @@ handle_interrupt() {
 cleanup() {
     log_info "Shutting down trainer..."
     cleanup_server
-    kill -- -$$ 2>/dev/null || true
     exit 0
 }
 
