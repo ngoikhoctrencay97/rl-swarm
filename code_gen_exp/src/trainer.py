@@ -252,7 +252,55 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             else:
                 padded.append(o)
         return torch.cat(padded, dim=0)
+        # ---------------------------------------------------------------------
+    # OVERRIDE genrl generate -> route through our safe_generate
+    # ---------------------------------------------------------------------
+    def generate(self, *args, **kwargs):
+        """
+        Intercept calls to generate from genrl (which calls self.model.generate).
+        Force safe generation kwargs (greedy, no sampling) and use safe_generate.
+        Accepts same basic args as model.generate: primarily input_ids tensor as first arg.
+        """
+        # If first positional arg exists and is input_ids tensor, use it
+        input_ids = None
+        if len(args) >= 1 and isinstance(args[0], torch.Tensor):
+            input_ids = args[0]
+        # If input_ids provided in kwargs
+        if input_ids is None and "input_ids" in kwargs:
+            input_ids = kwargs.pop("input_ids")
 
+        if input_ids is None:
+            raise ValueError("generate override expected input_ids as first arg or keyword.")
+
+        # Force generation config for quantized models (greedy)
+        try:
+            # Ensure model generation config uses greedy settings
+            if hasattr(self.model, "generation_config"):
+                gc = getattr(self.model, "generation_config")
+                # Hard settings to avoid multinomial/sampling
+                setattr(gc, "do_sample", False)
+                setattr(gc, "top_k", 1)
+                setattr(gc, "top_p", 1.0)
+                setattr(gc, "temperature", 1.0)
+                setattr(gc, "num_beams", 1)
+                setattr(gc, "use_cache", False)
+        except Exception:
+            pass
+
+        # Ensure kwargs do not request sampling
+        kwargs["do_sample"] = False
+        kwargs.setdefault("top_k", 1)
+        kwargs.setdefault("top_p", 1.0)
+        kwargs.setdefault("temperature", 1.0)
+        kwargs.setdefault("num_beams", 1)
+        kwargs.setdefault("use_cache", False)
+        # propagate pad/eos tokens if we have a tokenizer
+        if getattr(self, "_local_tokenizer", None) is not None:
+            kwargs.setdefault("pad_token_id", self._local_tokenizer.pad_token_id)
+            kwargs.setdefault("eos_token_id", self._local_tokenizer.eos_token_id)
+
+        # Use our safe_generate which handles batch splitting and disables cache
+        return self.safe_generate(input_ids, **kwargs)
     # ---------------------------------------------------------------------
     # Evaluation flow
     # ---------------------------------------------------------------------
