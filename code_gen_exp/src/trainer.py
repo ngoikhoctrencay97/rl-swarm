@@ -2,6 +2,7 @@ from typing import Any, List
 import torch
 import traceback
 import sys
+import re
 
 from genrl.data import DataManager
 from genrl.logging_utils.ml_logger import LoggerMixin
@@ -12,25 +13,25 @@ from genrl.trainer.grpo_trainer import GRPOLanguageTrainerModule
 from code_gen_exp.src.utils.judge_client import JudgeClient
 from code_gen_exp.src.solver_data import SYSTEM_PROMPTS
 
-# Optional
 try:
     from transformers import AutoTokenizer
 except:
     AutoTokenizer = None
 
 
+# =============================================================
+#               FINAL GRPO Trainer (FULL FIXED)
+# =============================================================
+
 class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
-    """
-    CRITICAL FIX: Override generate() method to prevent multinomial sampling errors
-    """
 
     def __init__(self, models: List[Any], **kwargs):
         self._local_tokenizer = None
 
-        # super() calls our overridden _initialize_model()
+        # super() will call our overridden _initialize_model()
         super().__init__(models, **kwargs)
 
-        # Judge client
+        # Judge service
         judge_base_url = kwargs.get("judge_base_url", None)
         self.judge_client = JudgeClient(judge_base_url) if judge_base_url else None
 
@@ -38,28 +39,25 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
 
         # Load tokenizer
         self._init_tokenizer(kwargs)
+        self._ensure_pad_token()
 
-        # Ensure pad token exists
-        try:
-            self._ensure_pad_token()
-        except Exception:
-            print("[GRPOTrainerModule] Warning: pad token ensure failed:\n",
-                  traceback.format_exc(),
-                  file=sys.stderr)
+        print("[trainer] Init complete. FIXED for 4-bit + genrl.")
 
-    # ===============================================================
-    #  OVERRIDE: BLOCK genrl from dtype-casting quantized models
-    # ===============================================================
+
+    # =========================================================
+    #                MODEL INIT (block dtype cast)
+    # =========================================================
     def _initialize_model(self, enable_gradient_checkpointing: bool):
         model_type = str(type(self.model)).lower()
         quantized = (
             hasattr(self.model, "is_quantized")
-            or "bitsandbytes" in model_type
+            or hasattr(self.model, "is_loaded_in_4bit")
             or "bnb" in model_type
+            or "bitsandbytes" in model_type
         )
 
         if quantized:
-            print("[GRPOTrainerModule] Detected BitsAndBytes 4-bit model → skipping dtype cast")
+            print("[trainer] 4-bit model detected → skipping dtype cast")
 
             try:
                 self.model = self.model.to(self.device)
@@ -76,41 +74,37 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
                     self.model.gradient_checkpointing_enable()
                 except:
                     pass
-
             return
 
-        # Regular, non-quantized
+        # Normal model
         super()._initialize_model(enable_gradient_checkpointing)
 
-    # ===============================================================
-    #  Load tokenizer
-    # ===============================================================
+
+    # =========================================================
+    #                TOKENIZER LOAD + PAD FIX
+    # =========================================================
     def _init_tokenizer(self, kwargs):
         tok = getattr(self.processing_class, "tokenizer", None)
-        if tok is not None:
+        if tok:
             self._local_tokenizer = tok
             return
 
-        tok = kwargs.get("tokenizer", None)
-        if tok is not None:
+        tok = kwargs.get("tokenizer")
+        if tok:
             self._local_tokenizer = tok
             return
 
-        # Auto-load tokenizer
         if AutoTokenizer and hasattr(self.model, "name_or_path"):
             try:
-                t = AutoTokenizer.from_pretrained(
+                tok = AutoTokenizer.from_pretrained(
                     self.model.name_or_path,
                     use_fast=True
                 )
-                self._local_tokenizer = t
-                print(f"[GRPOTrainerModule] Auto-loaded tokenizer: {self.model.name_or_path}")
+                self._local_tokenizer = tok
+                print("[trainer] Auto-loaded tokenizer:", self.model.name_or_path)
             except:
                 pass
 
-    # ===============================================================
-    #  Ensure pad token exists
-    # ===============================================================
     def _ensure_pad_token(self):
         tok = self._local_tokenizer
         if tok is None:
@@ -119,186 +113,39 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         if tok.pad_token is None:
             if tok.eos_token:
                 tok.add_special_tokens({"pad_token": tok.eos_token})
-                print("[GRPOTrainerModule] pad_token added = eos_token")
+                print("[trainer] pad_token set = eos_token")
 
                 if hasattr(self.model, "resize_token_embeddings"):
                     try:
                         self.model.resize_token_embeddings(len(tok))
-                        print("[GRPOTrainerModule] Resized embeddings:", len(tok))
                     except:
-                        print("[GRPOTrainerModule] resize_token_embeddings failed", file=sys.stderr)
+                        print("[trainer] resize embeddings failed")
 
-        self._local_tokenizer = tok
 
-    # ===============================================================
-    #  CRITICAL: Override generate() - this is what genrl calls!
-    # ===============================================================
+    # =========================================================
+    #       *** CRITICAL FIX: OVERRIDE _model_generate ***
+    # =========================================================
     @torch.no_grad()
-    def generate(self, prompts, **kwargs):
+    def _model_generate(self, input_ids, attention_mask=None, **kwargs):
         """
-        CRITICAL OVERRIDE: This is the method genrl.trainer.grpo_trainer calls!
-        We must intercept it here to prevent sampling errors.
-        
-        Args:
-            prompts: Can be a Dataset, list of dicts, or tensor
+        THIS is the method called by genrl.
+        Safe GREEDY decoding to avoid multinomial / CUDA errors.
         """
-        print(f"[GRPOTrainerModule] generate() called, type: {type(prompts)}")
-        
-        # Handle HuggingFace Dataset
-        if hasattr(prompts, 'to_pandas') or 'Dataset' in str(type(prompts)):
-            try:
-                # Convert HuggingFace Dataset to list of dicts
-                print(f"[GRPOTrainerModule] Converting HuggingFace Dataset to list")
-                
-                # Get column names
-                if hasattr(prompts, 'column_names'):
-                    cols = prompts.column_names
-                    print(f"[GRPOTrainerModule] Dataset columns: {cols}")
-                
-                # Convert to list - this will give us list of dicts
-                if hasattr(prompts, 'to_list'):
-                    prompts = prompts.to_list()
-                else:
-                    # Iterate through dataset
-                    prompts_list = []
-                    for i in range(len(prompts)):
-                        prompts_list.append(prompts[i])
-                    prompts = prompts_list
-                    
-                print(f"[GRPOTrainerModule] Converted to {len(prompts)} items")
-                if prompts:
-                    print(f"[GRPOTrainerModule] First item type: {type(prompts[0])}")
-                    print(f"[GRPOTrainerModule] First item keys: {prompts[0].keys() if isinstance(prompts[0], dict) else 'N/A'}")
-                    
-            except Exception as e:
-                print(f"[GRPOTrainerModule] Error converting Dataset: {e}", file=sys.stderr)
-                print(traceback.format_exc(), file=sys.stderr)
-                raise
-        
-        # Handle other iterable types
-        elif not isinstance(prompts, (list, tuple, torch.Tensor)):
-            try:
-                print(f"[GRPOTrainerModule] Converting {type(prompts)} to list")
-                prompts = list(prompts)
-            except Exception as e:
-                print(f"[GRPOTrainerModule] Error converting to list: {e}", file=sys.stderr)
-                raise TypeError(f"Cannot process prompts of type {type(prompts)}")
-        
-        print(f"[GRPOTrainerModule] Processing {len(prompts) if hasattr(prompts, '__len__') else '?'} prompts")
-        
-        # Get input_ids from prompts
-        if isinstance(prompts, (list, tuple)):
-            # Check what's in the list
-            if not prompts:
-                raise ValueError("Empty prompts list")
-            
-            first_item = prompts[0]
-            
-            # Case 1: Already tokenized (dict with 'input_ids')
-            if isinstance(first_item, dict) and 'input_ids' in first_item:
-                print("[GRPOTrainerModule] Prompts already tokenized")
-                input_ids_list = []
-                for item in prompts:
-                    ids = item['input_ids']
-                    if isinstance(ids, list):
-                        ids = torch.tensor(ids)
-                    if ids.dim() == 1:
-                        ids = ids.unsqueeze(0)
-                    input_ids_list.append(ids)
-                
-                # Pad to same length
-                max_len = max(ids.shape[1] for ids in input_ids_list)
-                pad_id = self._local_tokenizer.pad_token_id if self._local_tokenizer else 0
-                
-                padded = []
-                for ids in input_ids_list:
-                    if ids.shape[1] < max_len:
-                        pad = torch.full((1, max_len - ids.shape[1]), pad_id, dtype=ids.dtype)
-                        padded.append(torch.cat([ids, pad], dim=1))
-                    else:
-                        padded.append(ids)
-                
-                input_ids = torch.cat(padded, dim=0)
-            
-            # Case 2: Tensor
-            elif isinstance(first_item, torch.Tensor):
-                print("[GRPOTrainerModule] Prompts are tensors")
-                input_ids_list = [t.unsqueeze(0) if t.dim() == 1 else t for t in prompts]
-                input_ids = torch.cat(input_ids_list, dim=0)
-            
-            # Case 3: Need to tokenize (chat messages)
-            else:
-                print("[GRPOTrainerModule] Tokenizing prompts")
-                input_ids_list = []
-                for prompt in prompts:
-                    # Check if it's already a formatted prompt string
-                    if isinstance(prompt, dict):
-                        # Priority order: prompt > user_prompt > messages
-                        if 'prompt' in prompt and isinstance(prompt['prompt'], (list, str)):
-                            messages = prompt['prompt']
-                        elif 'messages' in prompt:
-                            messages = prompt['messages']
-                        elif 'user_prompt' in prompt:
-                            # Build messages from system_prompt and user_prompt
-                            messages = []
-                            if 'system_prompt' in prompt and prompt['system_prompt']:
-                                messages.append({"role": "system", "content": prompt['system_prompt']})
-                            messages.append({"role": "user", "content": prompt['user_prompt']})
-                        else:
-                            # Fallback: treat whole dict as single message
-                            messages = [{"role": "user", "content": str(prompt)}]
-                    elif isinstance(prompt, list):
-                        messages = prompt
-                    elif isinstance(prompt, str):
-                        messages = [{"role": "user", "content": prompt}]
-                    else:
-                        messages = [{"role": "user", "content": str(prompt)}]
-                    
-                    try:
-                        ids = self.processing_class.apply_chat_template(
-                            messages,
-                            tokenize=True,
-                            add_generation_prompt=True,
-                            return_tensors="pt"
-                        )
-                        input_ids_list.append(ids)
-                    except Exception as e:
-                        print(f"[GRPOTrainerModule] Tokenization error: {e}", file=sys.stderr)
-                        print(f"[GRPOTrainerModule] Messages: {messages}", file=sys.stderr)
-                        raise
-                
-                # Pad to same length
-                max_len = max(ids.shape[1] for ids in input_ids_list)
-                pad_id = self._local_tokenizer.pad_token_id if self._local_tokenizer else 0
-                
-                padded = []
-                for ids in input_ids_list:
-                    if ids.shape[1] < max_len:
-                        pad = torch.full((1, max_len - ids.shape[1]), pad_id, dtype=ids.dtype)
-                        padded.append(torch.cat([ids, pad], dim=1))
-                    else:
-                        padded.append(ids)
-                
-                input_ids = torch.cat(padded, dim=0)
-        elif isinstance(prompts, torch.Tensor):
-            input_ids = prompts
-        else:
-            raise TypeError(f"Unsupported prompts type: {type(prompts)}")
 
-        # Move to device
         device = self.model.device
         input_ids = input_ids.to(device)
-        
-        # Create attention mask
-        if self._local_tokenizer and self._local_tokenizer.pad_token_id is not None:
-            attention_mask = (input_ids != self._local_tokenizer.pad_token_id).long()
-        else:
-            attention_mask = torch.ones_like(input_ids)
 
-        # FORCE greedy decoding - remove ALL sampling parameters
+        if attention_mask is None:
+            if self._local_tokenizer:
+                pad_id = self._local_tokenizer.pad_token_id
+                attention_mask = (input_ids != pad_id).long()
+            else:
+                attention_mask = torch.ones_like(input_ids)
+        else:
+            attention_mask = attention_mask.to(device)
+
+        # Force safe generation
         gen_kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
             "max_new_tokens": kwargs.get("max_new_tokens", self.args.max_new_tokens),
             "do_sample": False,
             "num_beams": 1,
@@ -307,77 +154,52 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             "eos_token_id": self._local_tokenizer.eos_token_id if self._local_tokenizer else 1,
         }
 
-        # Remove any dangerous parameters from kwargs
-        dangerous_keys = ['temperature', 'top_k', 'top_p', 'renormalize_logits', 
-                         'typical_p', 'penalty_alpha', 'repetition_penalty', 
-                         'do_sample', 'num_beams', 'num_beam_groups']
-        
-        # Clean kwargs completely - only keep safe ones
-        safe_keys = ['max_new_tokens', 'max_length', 'min_length']
-        cleaned_kwargs = {k: v for k, v in kwargs.items() if k in safe_keys}
-        
-        # Merge with our safe defaults
-        gen_kwargs.update(cleaned_kwargs)
+        # Remove unsafe params
+        unsafe = ["temperature", "top_k", "top_p", "typical_p",
+                  "repetition_penalty", "penalty_alpha"]
+        for k in unsafe:
+            gen_kwargs.pop(k, None)
 
-        print(f"[GRPOTrainerModule] Generating with greedy decoding (batch_size={input_ids.shape[0]})")
+        batch = input_ids.shape[0]
+        outputs = []
 
-        # Generate one by one for safety with 4-bit models
-        if input_ids.shape[0] == 1:
+        # Generate one sample at a time → stable for 4-bit
+        for i in range(batch):
+            ids = input_ids[i:i+1]
+            mask = attention_mask[i:i+1]
+
             try:
-                outputs = self.model.generate(**gen_kwargs)
-                return outputs
+                out = self.model.generate(
+                    input_ids=ids,
+                    attention_mask=mask,
+                    **gen_kwargs
+                )
+                outputs.append(out.cpu())
             except Exception as e:
-                print(f"[GRPOTrainerModule] Generation failed: {e}", file=sys.stderr)
-                print(traceback.format_exc(), file=sys.stderr)
-                # Fallback: return input
-                return input_ids
+                print(f"[trainer] _model_generate failed: {e}")
+                outputs.append(ids.cpu())
 
-        # Batch > 1: generate one by one
-        all_outputs = []
-        for i in range(input_ids.shape[0]):
-            single_kwargs = gen_kwargs.copy()
-            single_kwargs["input_ids"] = input_ids[i:i+1]
-            single_kwargs["attention_mask"] = attention_mask[i:i+1]
-            
-            try:
-                output = self.model.generate(**single_kwargs)
-                all_outputs.append(output.cpu())
-            except Exception as e:
-                print(f"[GRPOTrainerModule] Generation failed for item {i}: {e}", file=sys.stderr)
-                # Fallback: use input
-                all_outputs.append(input_ids[i:i+1].cpu())
-
-        # Pad outputs to same length
-        max_len = max(o.shape[1] for o in all_outputs)
+        # pad all outputs to same length
+        max_len = max(o.shape[1] for o in outputs)
         pad_id = gen_kwargs["pad_token_id"]
-        padded_outputs = []
-        
-        for o in all_outputs:
+
+        padded = []
+        for o in outputs:
             if o.shape[1] < max_len:
                 pad = torch.full((1, max_len - o.shape[1]), pad_id, dtype=o.dtype)
-                padded_outputs.append(torch.cat([o, pad], dim=1))
+                padded.append(torch.cat([o, pad], dim=1))
             else:
-                padded_outputs.append(o)
+                padded.append(o)
 
-        return torch.cat(padded_outputs, dim=0).to(device)
-    
-    # ===============================================================
-    #  DEBUG: Check what we generated
-    # ===============================================================
-    def _debug_outputs(self, outputs):
-        """Debug helper to see what was generated"""
-        try:
-            if self._local_tokenizer:
-                decoded = self._local_tokenizer.decode(outputs[0], skip_special_tokens=True)
-                print(f"[GRPOTrainerModule] Generated text (first sample): {decoded[:200]}...")
-        except Exception as e:
-            print(f"[GRPOTrainerModule] Could not decode output: {e}", file=sys.stderr)
+        return torch.cat(padded, dim=0).to(device)
 
-    # ===============================================================
-    #  EVALUATE
-    # ===============================================================
+
+    # =========================================================
+    #                   EVALUATE (SAFE)
+    # =========================================================
     @torch.no_grad()
     def evaluate(self, state: GameState, data_manager: DataManager, reward_manager: RewardManager):
+
         if not self.judge_client:
             return
 
@@ -391,38 +213,62 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         if not result:
             return
 
+        question = result.get("question", "")
+
         prompt = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": result["question"]},
+            {"role": "system", "content": SYSTEM_PROMPTS["default"]},
+            {"role": "user", "content": question}
         ]
 
+        # tokenize input
+        input_ids = self.processing_class.apply_chat_template(
+            prompt,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        input_ids = input_ids.to(self.model.device)
+
+        # generate using fixed method
         try:
-            # Use our safe generate method
-            outputs = self.generate(
-                [prompt],
-                max_new_tokens=self.args.max_new_tokens
+            gen = self._model_generate(
+                input_ids,
+                max_new_tokens=min(128, self.args.max_new_tokens)
             )
         except Exception as e:
-            print("[GRPOTrainerModule] Generation failed:", e, file=sys.stderr)
-            print(traceback.format_exc(), file=sys.stderr)
+            print("[trainer] evaluate generation failed:", e)
             return
 
+        # decode output
         try:
-            if hasattr(self.processing_class, "decode"):
-                answer = self.processing_class.decode(outputs[0], skip_special_tokens=True)
-            elif self._local_tokenizer:
-                answer = self._local_tokenizer.decode(outputs[0].tolist(), skip_special_tokens=True)
+            text = self.processing_class.decode(gen[0], skip_special_tokens=True)
+        except:
+            if self._local_tokenizer:
+                text = self._local_tokenizer.decode(gen[0].tolist(), skip_special_tokens=True)
             else:
-                answer = "[decode_error]"
-        except Exception as e:
-            print(f"[GRPOTrainerModule] Decode failed: {e}", file=sys.stderr)
-            answer = "[decode_error]"
+                text = ""
 
+        text = text.strip()
+        print("[trainer] Raw model output:", text)
+
+        # Extract clean answer
+        ans_match = re.findall(r"<answer>(.*?)</answer>", text, flags=re.S | re.I)
+        if ans_match:
+            final = ans_match[-1].strip()
+        else:
+            # Fallback: first non-empty line
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            final = lines[0] if lines else ""
+
+        final = final.strip()
+        print("[trainer] Final extracted answer:", final)
+
+        # submit
         try:
             self.judge_client.submit_answer(
-                session_id=result["session_id"],
+                session_id=result.get("session_id"),
                 round_number=state.round,
-                user_answer=answer
+                user_answer=final
             )
         except Exception as e:
-            print(f"[GRPOTrainerModule] submit_answer failed: {e}", file=sys.stderr)
+            print("[trainer] submit_answer failed:", e)
