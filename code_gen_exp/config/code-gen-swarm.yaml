@@ -61,7 +61,6 @@ game_manager:
           load_in_4bit: true
           bnb_4bit_use_double_quant: true
           bnb_4bit_quant_type: "nf4"
-          bnb_4bit_compute_dtype: "bfloat16"
     config:
       _target_: genrl.trainer.grpo_trainer.GRPOTrainerConfig
       dtype: ${training.dtype}
