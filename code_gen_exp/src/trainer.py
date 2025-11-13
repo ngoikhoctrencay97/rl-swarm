@@ -142,79 +142,125 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         Args:
             prompts: Can be a Dataset, list of dicts, or tensor
         """
-        print(f"[DEBUG] prompts type: {type(prompts)}")
-        print(f"[DEBUG] prompts dir: {dir(prompts)[:10]}")  # First 10 attributes
-        if hasattr(prompts, '__len__'):
-            print(f"[DEBUG] prompts length: {len(prompts)}")
-        if hasattr(prompts, '__getitem__'):
-            try:
-                print(f"[DEBUG] prompts[0] type: {type(prompts[0])}")
-                print(f"[DEBUG] prompts[0]: {prompts[0]}")
-            except:
-                pass
         print(f"[GRPOTrainerModule] generate() called, type: {type(prompts)}")
         
-        # Handle different input types
-        if not isinstance(prompts, (list, tuple, torch.Tensor)):
-            # It's a Dataset or similar iterable
+        # Handle HuggingFace Dataset
+        if hasattr(prompts, 'to_pandas') or 'Dataset' in str(type(prompts)):
             try:
-                # Try to get the actual prompts data
-                if hasattr(prompts, 'data'):
-                    prompts = prompts.data
-                elif hasattr(prompts, 'dataset'):
-                    prompts = prompts.dataset
-                elif hasattr(prompts, '__iter__'):
-                    # Convert to list
-                    prompts = list(prompts)
+                # Convert HuggingFace Dataset to list of dicts
+                print(f"[GRPOTrainerModule] Converting HuggingFace Dataset to list")
+                
+                # Get column names
+                if hasattr(prompts, 'column_names'):
+                    cols = prompts.column_names
+                    print(f"[GRPOTrainerModule] Dataset columns: {cols}")
+                
+                # Convert to list - this will give us list of dicts
+                if hasattr(prompts, 'to_list'):
+                    prompts = prompts.to_list()
                 else:
-                    raise TypeError(f"Cannot process prompts of type {type(prompts)}")
+                    # Iterate through dataset
+                    prompts_list = []
+                    for i in range(len(prompts)):
+                        prompts_list.append(prompts[i])
+                    prompts = prompts_list
+                    
+                print(f"[GRPOTrainerModule] Converted to {len(prompts)} items")
+                if prompts:
+                    print(f"[GRPOTrainerModule] First item type: {type(prompts[0])}")
+                    print(f"[GRPOTrainerModule] First item keys: {prompts[0].keys() if isinstance(prompts[0], dict) else 'N/A'}")
+                    
             except Exception as e:
-                print(f"[GRPOTrainerModule] Error extracting prompts: {e}", file=sys.stderr)
+                print(f"[GRPOTrainerModule] Error converting Dataset: {e}", file=sys.stderr)
                 print(traceback.format_exc(), file=sys.stderr)
                 raise
+        
+        # Handle other iterable types
+        elif not isinstance(prompts, (list, tuple, torch.Tensor)):
+            try:
+                print(f"[GRPOTrainerModule] Converting {type(prompts)} to list")
+                prompts = list(prompts)
+            except Exception as e:
+                print(f"[GRPOTrainerModule] Error converting to list: {e}", file=sys.stderr)
+                raise TypeError(f"Cannot process prompts of type {type(prompts)}")
         
         print(f"[GRPOTrainerModule] Processing {len(prompts) if hasattr(prompts, '__len__') else '?'} prompts")
         
         # Get input_ids from prompts
         if isinstance(prompts, (list, tuple)):
-            # Prompts are chat messages or already processed
-            input_ids_list = []
-            for prompt in prompts:
-                # Check if already tokenized
-                if isinstance(prompt, torch.Tensor):
-                    input_ids_list.append(prompt.unsqueeze(0) if prompt.dim() == 1 else prompt)
-                elif isinstance(prompt, dict):
-                    # Chat format
+            # Check what's in the list
+            if not prompts:
+                raise ValueError("Empty prompts list")
+            
+            first_item = prompts[0]
+            
+            # Case 1: Already tokenized (dict with 'input_ids')
+            if isinstance(first_item, dict) and 'input_ids' in first_item:
+                print("[GRPOTrainerModule] Prompts already tokenized")
+                input_ids_list = []
+                for item in prompts:
+                    ids = item['input_ids']
+                    if isinstance(ids, list):
+                        ids = torch.tensor(ids)
+                    if ids.dim() == 1:
+                        ids = ids.unsqueeze(0)
+                    input_ids_list.append(ids)
+                
+                # Pad to same length
+                max_len = max(ids.shape[1] for ids in input_ids_list)
+                pad_id = self._local_tokenizer.pad_token_id if self._local_tokenizer else 0
+                
+                padded = []
+                for ids in input_ids_list:
+                    if ids.shape[1] < max_len:
+                        pad = torch.full((1, max_len - ids.shape[1]), pad_id, dtype=ids.dtype)
+                        padded.append(torch.cat([ids, pad], dim=1))
+                    else:
+                        padded.append(ids)
+                
+                input_ids = torch.cat(padded, dim=0)
+            
+            # Case 2: Tensor
+            elif isinstance(first_item, torch.Tensor):
+                print("[GRPOTrainerModule] Prompts are tensors")
+                input_ids_list = [t.unsqueeze(0) if t.dim() == 1 else t for t in prompts]
+                input_ids = torch.cat(input_ids_list, dim=0)
+            
+            # Case 3: Need to tokenize (chat messages)
+            else:
+                print("[GRPOTrainerModule] Tokenizing prompts")
+                input_ids_list = []
+                for prompt in prompts:
+                    # Check if it's a list of messages or dict
+                    if isinstance(prompt, dict) and 'messages' in prompt:
+                        messages = prompt['messages']
+                    elif isinstance(prompt, list):
+                        messages = prompt
+                    else:
+                        # Assume it's a single message - wrap it
+                        messages = [{"role": "user", "content": str(prompt)}]
+                    
                     ids = self.processing_class.apply_chat_template(
-                        prompt if isinstance(prompt, list) else [prompt],
+                        messages,
                         tokenize=True,
                         add_generation_prompt=True,
                         return_tensors="pt"
                     )
                     input_ids_list.append(ids)
-                else:
-                    # Assume it's a message list
-                    ids = self.processing_class.apply_chat_template(
-                        prompt,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        return_tensors="pt"
-                    )
-                    input_ids_list.append(ids)
-            
-            # Pad to same length
-            max_len = max(ids.shape[1] for ids in input_ids_list)
-            pad_id = self._local_tokenizer.pad_token_id if self._local_tokenizer else 0
-            
-            padded = []
-            for ids in input_ids_list:
-                if ids.shape[1] < max_len:
-                    pad = torch.full((1, max_len - ids.shape[1]), pad_id, dtype=ids.dtype)
-                    padded.append(torch.cat([ids, pad], dim=1))
-                else:
-                    padded.append(ids)
-            
-            input_ids = torch.cat(padded, dim=0)
+                
+                # Pad to same length
+                max_len = max(ids.shape[1] for ids in input_ids_list)
+                pad_id = self._local_tokenizer.pad_token_id if self._local_tokenizer else 0
+                
+                padded = []
+                for ids in input_ids_list:
+                    if ids.shape[1] < max_len:
+                        pad = torch.full((1, max_len - ids.shape[1]), pad_id, dtype=ids.dtype)
+                        padded.append(torch.cat([ids, pad], dim=1))
+                    else:
+                        padded.append(ids)
+                
+                input_ids = torch.cat(padded, dim=0)
         elif isinstance(prompts, torch.Tensor):
             input_ids = prompts
         else:
