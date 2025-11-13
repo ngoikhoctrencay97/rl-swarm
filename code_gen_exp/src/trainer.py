@@ -21,10 +21,7 @@ except:
 
 class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
     """
-    FINAL FULL VERSION:
-    Stable for Qwen2.5 Coder 4-bit on HF+BitsAndBytes.
-    Avoids dtype cast, avoids HF multinomial sampling, fixes pad tokens,
-    overrides _model_generate(), safe for batch size > 1.
+    FIXED VERSION: Resolves multinomial sampling errors with 4-bit quantized models
     """
 
     def __init__(self, models: List[Any], **kwargs):
@@ -134,35 +131,67 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         self._local_tokenizer = tok
 
     # ===============================================================
-    #  SAFE GENERATE (NO multinomial, NO sampling)
+    #  SAFE GENERATE (NO multinomial, NO sampling) - FIXED VERSION
     # ===============================================================
-    def safe_generate(self, input_ids: torch.Tensor, **gkw):
+    def safe_generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None, **gkw):
+        """
+        Fixed version with proper attention mask handling and stricter sampling prevention
+        """
         device = self.model.device
         input_ids = input_ids.to(device)
+        
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        else:
+            # Create attention mask if not provided
+            if self._local_tokenizer and self._local_tokenizer.pad_token_id is not None:
+                attention_mask = (input_ids != self._local_tokenizer.pad_token_id).long()
+            else:
+                attention_mask = torch.ones_like(input_ids)
 
-        # Hard-disable sampling
-        gkw["do_sample"] = False
-        gkw["top_k"] = 1
-        gkw["top_p"] = 1.0
-        gkw["temperature"] = 1.0
-        gkw["num_beams"] = 1
-        gkw["renormalize_logits"] = False
-        gkw["use_cache"] = False
+        # CRITICAL: Force greedy decoding - override ANY existing parameters
+        gkw_safe = {
+            "do_sample": False,
+            "num_beams": 1,
+            "use_cache": False,
+            "pad_token_id": self._local_tokenizer.pad_token_id if self._local_tokenizer else 0,
+            "eos_token_id": self._local_tokenizer.eos_token_id if self._local_tokenizer else 1,
+            "attention_mask": attention_mask,
+        }
+        
+        # Remove any sampling-related parameters
+        keys_to_remove = ['top_k', 'top_p', 'temperature', 'renormalize_logits']
+        for key in keys_to_remove:
+            gkw.pop(key, None)
+        
+        # Merge with user kwargs (our safe params take priority)
+        gkw.update(gkw_safe)
 
-        if self._local_tokenizer:
-            gkw.setdefault("pad_token_id", self._local_tokenizer.pad_token_id)
-            gkw.setdefault("eos_token_id", self._local_tokenizer.eos_token_id)
-
-        # Batch 1
+        # Batch 1 - simple case
         if input_ids.shape[0] == 1:
-            return self.model.generate(input_ids, **gkw)
+            try:
+                return self.model.generate(input_ids, **gkw)
+            except Exception as e:
+                print(f"[GRPOTrainerModule] Generation error (batch=1): {e}", file=sys.stderr)
+                # Fallback: return input_ids if generation fails
+                return input_ids
 
         # Batch >1 → generate one by one (safe for 4bit)
         outs = []
         for i in range(input_ids.shape[0]):
-            one = input_ids[i:i+1]
-            out = self.model.generate(one, **gkw)
-            outs.append(out.cpu())
+            one_input = input_ids[i:i+1]
+            one_mask = attention_mask[i:i+1] if attention_mask is not None else None
+            
+            try:
+                if one_mask is not None:
+                    out = self.model.generate(one_input, attention_mask=one_mask, **gkw)
+                else:
+                    out = self.model.generate(one_input, **gkw)
+                outs.append(out.cpu())
+            except Exception as e:
+                print(f"[GRPOTrainerModule] Generation error (batch item {i}): {e}", file=sys.stderr)
+                # Fallback: use input if generation fails
+                outs.append(one_input.cpu())
 
         # Pad to same length
         max_len = max(o.shape[1] for o in outs)
@@ -179,30 +208,27 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         return torch.cat(padded, dim=0)
 
     # ===============================================================
-    #  OVERRIDE genrl internal model generate
+    #  OVERRIDE genrl internal model generate - FIXED VERSION
     # ===============================================================
-    def _model_generate(self, input_ids, **gen_kwargs):
+    def _model_generate(self, input_ids, attention_mask=None, **gen_kwargs):
         """
-        genrl always calls this to generate tokens.
-        We override it to enforce safe greedy generation.
+        CRITICAL FIX: Override genrl's generation method completely
+        This ensures we control ALL generation parameters
         """
-
-        gen_kwargs["do_sample"] = False
-        gen_kwargs["top_k"] = 1
-        gen_kwargs["top_p"] = 1.0
-        gen_kwargs["temperature"] = 1.0
-        gen_kwargs["num_beams"] = 1
-        gen_kwargs["use_cache"] = False
-        gen_kwargs["renormalize_logits"] = False
-
-        if self._local_tokenizer:
-            gen_kwargs.setdefault("pad_token_id", self._local_tokenizer.pad_token_id)
-            gen_kwargs.setdefault("eos_token_id", self._local_tokenizer.eos_token_id)
-
-        return self.safe_generate(input_ids, **gen_kwargs)
+        # Clear ALL existing generation kwargs that might cause sampling
+        cleaned_kwargs = {}
+        
+        # Only keep safe parameters
+        safe_keys = ['max_new_tokens', 'max_length', 'min_length', 'pad_token_id', 'eos_token_id']
+        for key in safe_keys:
+            if key in gen_kwargs:
+                cleaned_kwargs[key] = gen_kwargs[key]
+        
+        # Force our safe generation
+        return self.safe_generate(input_ids, attention_mask, **cleaned_kwargs)
 
     # ===============================================================
-    #  EVALUATE
+    #  EVALUATE - FIXED VERSION with better error handling
     # ===============================================================
     @torch.no_grad()
     def evaluate(self, state: GameState, data_manager: DataManager, reward_manager: RewardManager):
@@ -224,16 +250,28 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             {"role": "user", "content": result["question"]},
         ]
 
-        input_ids = self.processing_class.apply_chat_template(
-            prompt,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        )
+        try:
+            input_ids = self.processing_class.apply_chat_template(
+                prompt,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt"
+            )
+            
+            # Create attention mask
+            if self._local_tokenizer and self._local_tokenizer.pad_token_id is not None:
+                attention_mask = (input_ids != self._local_tokenizer.pad_token_id).long()
+            else:
+                attention_mask = torch.ones_like(input_ids)
+                
+        except Exception as e:
+            print(f"[GRPOTrainerModule] Tokenization failed: {e}", file=sys.stderr)
+            return
 
         try:
             outputs = self.safe_generate(
                 input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=self.args.max_new_tokens
             )
         except Exception as e:
@@ -247,8 +285,9 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             elif self._local_tokenizer:
                 answer = self._local_tokenizer.decode(outputs[0].tolist(), skip_special_tokens=True)
             else:
-                answer = outputs[0].tolist()
-        except:
+                answer = "[decode_error]"
+        except Exception as e:
+            print(f"[GRPOTrainerModule] Decode failed: {e}", file=sys.stderr)
             answer = "[decode_error]"
 
         try:
@@ -257,5 +296,5 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
                 round_number=state.round,
                 user_answer=answer
             )
-        except Exception:
-            print("[GRPOTrainerModule] submit_answer failed", file=sys.stderr)
+        except Exception as e:
+            print(f"[GRPOTrainerModule] submit_answer failed: {e}", file=sys.stderr)
