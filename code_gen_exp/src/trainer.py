@@ -142,6 +142,16 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         Args:
             prompts: Can be a Dataset, list of dicts, or tensor
         """
+        print(f"[DEBUG] prompts type: {type(prompts)}")
+        print(f"[DEBUG] prompts dir: {dir(prompts)[:10]}")  # First 10 attributes
+        if hasattr(prompts, '__len__'):
+            print(f"[DEBUG] prompts length: {len(prompts)}")
+        if hasattr(prompts, '__getitem__'):
+            try:
+                print(f"[DEBUG] prompts[0] type: {type(prompts[0])}")
+                print(f"[DEBUG] prompts[0]: {prompts[0]}")
+            except:
+                pass
         print(f"[GRPOTrainerModule] generate() called, type: {type(prompts)}")
         
         # Handle different input types
