@@ -21,7 +21,7 @@ except:
 
 class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
     """
-    FIXED VERSION: Resolves multinomial sampling errors with 4-bit quantized models
+    CRITICAL FIX: Override generate() method to prevent multinomial sampling errors
     """
 
     def __init__(self, models: List[Any], **kwargs):
@@ -131,104 +131,117 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         self._local_tokenizer = tok
 
     # ===============================================================
-    #  SAFE GENERATE (NO multinomial, NO sampling) - FIXED VERSION
+    #  CRITICAL: Override generate() - this is what genrl calls!
     # ===============================================================
-    def safe_generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None, **gkw):
+    @torch.no_grad()
+    def generate(self, prompts, **kwargs):
         """
-        Fixed version with proper attention mask handling and stricter sampling prevention
+        CRITICAL OVERRIDE: This is the method genrl.trainer.grpo_trainer calls!
+        We must intercept it here to prevent sampling errors.
         """
+        print(f"[GRPOTrainerModule] generate() called with {len(prompts)} prompts")
+        
+        # Get input_ids from prompts
+        if isinstance(prompts, list):
+            # Prompts are chat messages
+            input_ids_list = []
+            for prompt in prompts:
+                ids = self.processing_class.apply_chat_template(
+                    prompt,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt"
+                )
+                input_ids_list.append(ids)
+            
+            # Pad to same length
+            max_len = max(ids.shape[1] for ids in input_ids_list)
+            pad_id = self._local_tokenizer.pad_token_id if self._local_tokenizer else 0
+            
+            padded = []
+            for ids in input_ids_list:
+                if ids.shape[1] < max_len:
+                    pad = torch.full((1, max_len - ids.shape[1]), pad_id, dtype=ids.dtype)
+                    padded.append(torch.cat([ids, pad], dim=1))
+                else:
+                    padded.append(ids)
+            
+            input_ids = torch.cat(padded, dim=0)
+        else:
+            input_ids = prompts
+
+        # Move to device
         device = self.model.device
         input_ids = input_ids.to(device)
         
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
+        # Create attention mask
+        if self._local_tokenizer and self._local_tokenizer.pad_token_id is not None:
+            attention_mask = (input_ids != self._local_tokenizer.pad_token_id).long()
         else:
-            # Create attention mask if not provided
-            if self._local_tokenizer and self._local_tokenizer.pad_token_id is not None:
-                attention_mask = (input_ids != self._local_tokenizer.pad_token_id).long()
-            else:
-                attention_mask = torch.ones_like(input_ids)
+            attention_mask = torch.ones_like(input_ids)
 
-        # CRITICAL: Force greedy decoding - override ANY existing parameters
-        gkw_safe = {
+        # FORCE greedy decoding - remove ALL sampling parameters
+        gen_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": kwargs.get("max_new_tokens", self.args.max_new_tokens),
             "do_sample": False,
             "num_beams": 1,
             "use_cache": False,
             "pad_token_id": self._local_tokenizer.pad_token_id if self._local_tokenizer else 0,
             "eos_token_id": self._local_tokenizer.eos_token_id if self._local_tokenizer else 1,
-            "attention_mask": attention_mask,
         }
-        
-        # Remove any sampling-related parameters
-        keys_to_remove = ['top_k', 'top_p', 'temperature', 'renormalize_logits']
-        for key in keys_to_remove:
-            gkw.pop(key, None)
-        
-        # Merge with user kwargs (our safe params take priority)
-        gkw.update(gkw_safe)
 
-        # Batch 1 - simple case
+        # Remove any dangerous parameters
+        dangerous_keys = ['temperature', 'top_k', 'top_p', 'renormalize_logits', 
+                         'typical_p', 'penalty_alpha', 'repetition_penalty']
+        for key in dangerous_keys:
+            gen_kwargs.pop(key, None)
+
+        print(f"[GRPOTrainerModule] Generating with greedy decoding (batch_size={input_ids.shape[0]})")
+
+        # Generate one by one for safety with 4-bit models
         if input_ids.shape[0] == 1:
             try:
-                return self.model.generate(input_ids, **gkw)
+                outputs = self.model.generate(**gen_kwargs)
+                return outputs
             except Exception as e:
-                print(f"[GRPOTrainerModule] Generation error (batch=1): {e}", file=sys.stderr)
-                # Fallback: return input_ids if generation fails
+                print(f"[GRPOTrainerModule] Generation failed: {e}", file=sys.stderr)
+                print(traceback.format_exc(), file=sys.stderr)
+                # Fallback: return input
                 return input_ids
 
-        # Batch >1 → generate one by one (safe for 4bit)
-        outs = []
+        # Batch > 1: generate one by one
+        all_outputs = []
         for i in range(input_ids.shape[0]):
-            one_input = input_ids[i:i+1]
-            one_mask = attention_mask[i:i+1] if attention_mask is not None else None
+            single_kwargs = gen_kwargs.copy()
+            single_kwargs["input_ids"] = input_ids[i:i+1]
+            single_kwargs["attention_mask"] = attention_mask[i:i+1]
             
             try:
-                if one_mask is not None:
-                    out = self.model.generate(one_input, attention_mask=one_mask, **gkw)
-                else:
-                    out = self.model.generate(one_input, **gkw)
-                outs.append(out.cpu())
+                output = self.model.generate(**single_kwargs)
+                all_outputs.append(output.cpu())
             except Exception as e:
-                print(f"[GRPOTrainerModule] Generation error (batch item {i}): {e}", file=sys.stderr)
-                # Fallback: use input if generation fails
-                outs.append(one_input.cpu())
+                print(f"[GRPOTrainerModule] Generation failed for item {i}: {e}", file=sys.stderr)
+                # Fallback: use input
+                all_outputs.append(input_ids[i:i+1].cpu())
 
-        # Pad to same length
-        max_len = max(o.shape[1] for o in outs)
-        pad_id = gkw.get("pad_token_id", 0)
-        padded = []
-
-        for o in outs:
+        # Pad outputs to same length
+        max_len = max(o.shape[1] for o in all_outputs)
+        pad_id = gen_kwargs["pad_token_id"]
+        padded_outputs = []
+        
+        for o in all_outputs:
             if o.shape[1] < max_len:
                 pad = torch.full((1, max_len - o.shape[1]), pad_id, dtype=o.dtype)
-                padded.append(torch.cat([o, pad], dim=1))
+                padded_outputs.append(torch.cat([o, pad], dim=1))
             else:
-                padded.append(o)
+                padded_outputs.append(o)
 
-        return torch.cat(padded, dim=0)
-
-    # ===============================================================
-    #  OVERRIDE genrl internal model generate - FIXED VERSION
-    # ===============================================================
-    def _model_generate(self, input_ids, attention_mask=None, **gen_kwargs):
-        """
-        CRITICAL FIX: Override genrl's generation method completely
-        This ensures we control ALL generation parameters
-        """
-        # Clear ALL existing generation kwargs that might cause sampling
-        cleaned_kwargs = {}
-        
-        # Only keep safe parameters
-        safe_keys = ['max_new_tokens', 'max_length', 'min_length', 'pad_token_id', 'eos_token_id']
-        for key in safe_keys:
-            if key in gen_kwargs:
-                cleaned_kwargs[key] = gen_kwargs[key]
-        
-        # Force our safe generation
-        return self.safe_generate(input_ids, attention_mask, **cleaned_kwargs)
+        return torch.cat(padded_outputs, dim=0).to(device)
 
     # ===============================================================
-    #  EVALUATE - FIXED VERSION with better error handling
+    #  EVALUATE
     # ===============================================================
     @torch.no_grad()
     def evaluate(self, state: GameState, data_manager: DataManager, reward_manager: RewardManager):
@@ -251,27 +264,9 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         ]
 
         try:
-            input_ids = self.processing_class.apply_chat_template(
-                prompt,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_tensors="pt"
-            )
-            
-            # Create attention mask
-            if self._local_tokenizer and self._local_tokenizer.pad_token_id is not None:
-                attention_mask = (input_ids != self._local_tokenizer.pad_token_id).long()
-            else:
-                attention_mask = torch.ones_like(input_ids)
-                
-        except Exception as e:
-            print(f"[GRPOTrainerModule] Tokenization failed: {e}", file=sys.stderr)
-            return
-
-        try:
-            outputs = self.safe_generate(
-                input_ids,
-                attention_mask=attention_mask,
+            # Use our safe generate method
+            outputs = self.generate(
+                [prompt],
                 max_new_tokens=self.args.max_new_tokens
             )
         except Exception as e:
