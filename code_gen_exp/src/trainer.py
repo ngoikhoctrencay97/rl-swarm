@@ -34,6 +34,10 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             **kwargs: Additional arguments for configuration.
         """
         super().__init__(models, **kwargs)
+        if hasattr(self.model, "is_quantized") or "bnb" in str(type(self.model)).lower():
+            # force genrl to skip dtype casting
+            self.dtype = None
+            self.args.dtype = None
         judge_base_url = kwargs.get("judge_base_url", None)
         self.judge_client = JudgeClient(judge_base_url) if judge_base_url else None
         self.system_prompt = SYSTEM_PROMPTS.get("solver", SYSTEM_PROMPTS["default"])
