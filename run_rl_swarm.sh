@@ -1,51 +1,75 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+# Removed set -euo pipefail for better error handling and process management
 
-# General arguments
-ROOT=$PWD
+# =============================================================================
+# RL-Swarm Launcher Script - Code-Gen Enhanced Version
+# =============================================================================
 
+# Configuration
+readonly ROOT="$PWD"
+readonly LOG_DIR="$ROOT/logs"
+readonly CONFIG_DIR="$ROOT/configs"
+
+# Environment variables with defaults
 export IDENTITY_PATH
 export GENSYN_RESET_CONFIG
 export CONNECT_TO_TESTNET=true
 export ORG_ID
-export HF_HUB_DOWNLOAD_TIMEOUT=120  # 2 minutes
+export HF_HUB_DOWNLOAD_TIMEOUT=120
 export SWARM_CONTRACT="0x7745a8FE4b8D2D2c3BB103F8dCae822746F35Da0"
 export HUGGINGFACE_ACCESS_TOKEN="None"
 
-# Path to an RSA private key. If this path does not exist, a new key pair will be created.
-# Remove this file if you want a new PeerID.
-DEFAULT_IDENTITY_PATH="$ROOT"/swarm.pem
+# Path configurations
+readonly DEFAULT_IDENTITY_PATH="$ROOT/swarm.pem"
 IDENTITY_PATH=${IDENTITY_PATH:-$DEFAULT_IDENTITY_PATH}
-
 DOCKER=${DOCKER:-""}
 GENSYN_RESET_CONFIG=${GENSYN_RESET_CONFIG:-""}
-
-# Bit of a workaround for the non-root docker container.
-if [ -n "$DOCKER" ]; then
-    volumes=(
-        /home/gensyn/rl_swarm/modal-login/temp-data
-        /home/gensyn/rl_swarm/keys
-        /home/gensyn/rl_swarm/configs
-        /home/gensyn/rl_swarm/logs
-    )
-
-    for volume in ${volumes[@]}; do
-        sudo chown -R 1001:1001 $volume
-    done
-fi
-
-# Will ignore any visible GPUs if set.
 CPU_ONLY=${CPU_ONLY:-""}
-
-# Set if successfully parsed from modal-login/temp-data/userData.json.
 ORG_ID=${ORG_ID:-""}
 
-GREEN_TEXT="\033[32m"
-BLUE_TEXT="\033[34m"
-RED_TEXT="\033[31m"
-RESET_TEXT="\033[0m"
+# Server variables
+SERVER_PID=""
 
+# Color codes
+readonly GREEN_TEXT="\033[32m"
+readonly BLUE_TEXT="\033[34m"
+readonly RED_TEXT="\033[31m"
+readonly YELLOW_TEXT="\033[33m"
+readonly CYAN_TEXT="\033[36m"
+readonly BOLD_TEXT="\033[1m"
+readonly RESET_TEXT="\033[0m"
+
+# Aliases for compatibility
+readonly GREEN="${GREEN_TEXT}${BOLD_TEXT}"
+readonly RED="${RED_TEXT}${BOLD_TEXT}"
+readonly YELLOW="${YELLOW_TEXT}${BOLD_TEXT}"
+readonly CYAN="${CYAN_TEXT}${BOLD_TEXT}"
+readonly BOLD="${BOLD_TEXT}"
+readonly NC="${RESET_TEXT}"
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+# Logging functions
+log_info() {
+    echo -e "${GREEN_TEXT}[INFO]${RESET_TEXT} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW_TEXT}[WARN]${RESET_TEXT} $1"
+}
+
+log_error() {
+    echo -e "${RED_TEXT}[ERROR]${RESET_TEXT} $1"
+}
+
+log_debug() {
+    echo -e "${BLUE_TEXT}[DEBUG]${RESET_TEXT} $1"
+}
+
+# Legacy echo functions for compatibility
 echo_green() {
     echo -e "$GREEN_TEXT$1$RESET_TEXT"
 }
@@ -58,18 +82,351 @@ echo_red() {
     echo -e "$RED_TEXT$1$RESET_TEXT"
 }
 
-ROOT_DIR="$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)"
+# Initialize directories
+init_directories() {
+    log_info "Initializing directories..."
+    
+    local directories=("$LOG_DIR" "$CONFIG_DIR")
+    
+    for dir in "${directories[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            log_info "Created directory: $dir"
+        fi
+    done
+}
 
-# Function to clean up the server process upon exit
+# Docker volume setup
+setup_docker_volumes() {
+    if [[ -n "$DOCKER" ]]; then
+        log_info "Setting up Docker volumes..."
+        
+        local volumes=(
+            "/home/gensyn/rl_swarm/modal-login/temp-data"
+            "/home/gensyn/rl_swarm/keys"
+            "/home/gensyn/rl_swarm/configs"
+            "/home/gensyn/rl_swarm/logs"
+        )
+        
+        for volume in "${volumes[@]}"; do
+            if [[ -d "$volume" ]]; then
+                sudo chown -R 1001:1001 "$volume"
+                log_info "Set ownership for volume: $volume"
+            fi
+        done
+    fi
+}
+
+# Enhanced system limits setup
+setup_system_limits() {
+    log_info "Setting up system limits to prevent resource errors..."
+    
+    # Increase file descriptor limits
+    ulimit -n 65536 2>/dev/null || {
+        log_warn "Failed to increase file descriptor limit"
+    }
+    
+    # Increase process limits
+    ulimit -u 32768 2>/dev/null || {
+        log_warn "Failed to increase process limit"
+    }
+    
+    # Set memory overcommit to prevent allocation failures
+    echo 1 | sudo tee /proc/sys/vm/overcommit_memory >/dev/null 2>&1 || {
+        log_debug "Could not set memory overcommit (may need sudo)"
+    }
+    
+    log_info "System limits configured"
+}
+
+# =============================================================================
+# Node.js and Yarn Installation
+# =============================================================================
+
+install_nodejs() {
+    if ! command -v node > /dev/null 2>&1; then
+        log_info "Node.js not found. Installing NVM and latest Node.js..."
+        
+        export NVM_DIR="$HOME/.nvm"
+        if [[ ! -d "$NVM_DIR" ]]; then
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+        fi
+        
+        # Source NVM
+        [[ -s "$NVM_DIR/nvm.sh" ]] && \. "$NVM_DIR/nvm.sh"
+        [[ -s "$NVM_DIR/bash_completion" ]] && \. "$NVM_DIR/bash_completion"
+        
+        nvm install node
+        log_info "Node.js installed successfully"
+    else
+        log_info "Node.js is already installed: $(node -v)"
+    fi
+}
+
+install_yarn() {
+    if ! command -v yarn > /dev/null 2>&1; then
+        log_info "Installing Yarn..."
+        
+        # Detect OS and install accordingly
+        if grep -qi "ubuntu" /etc/os-release 2> /dev/null || uname -r | grep -qi "microsoft"; then
+            log_info "Detected Ubuntu/WSL. Installing Yarn via apt..."
+            curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
+            echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
+            sudo apt update && sudo apt install -y yarn
+        else
+            log_info "Installing Yarn globally with npm..."
+            npm install -g --silent yarn
+        fi
+        
+        log_info "Yarn installed successfully"
+    else
+        log_info "Yarn is already installed: $(yarn --version)"
+    fi
+}
+
+# =============================================================================
+# Modal Login Server Setup
+# =============================================================================
+
+setup_modal_login() {
+    log_info "Setting up modal login server..."
+    echo "Please login to create an Ethereum Server Wallet"
+    
+    cd modal-login || {
+        log_error "Failed to change to modal-login directory"
+        return 1
+    }
+    
+    # Update environment file
+    local env_file="$ROOT/modal-login/.env"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "3s/.*/SWARM_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$env_file"
+    else
+        sed -i "3s/.*/SWARM_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$env_file"
+    fi
+    
+    # Install dependencies and build (skip if Docker)
+    if [[ -z "$DOCKER" ]]; then
+        log_info "Installing dependencies and building server..."
+        yarn install --immutable
+        log_info "Building server"
+        yarn build > "$LOG_DIR/yarn.log" 2>&1
+    fi
+    
+    # Start server
+    log_info "Starting modal login server..."
+    yarn start >> "$LOG_DIR/yarn.log" 2>&1 &
+    
+    SERVER_PID=$!
+    log_info "Started server process: $SERVER_PID"
+    sleep 5
+    
+    # Open browser
+    if [[ -z "$DOCKER" ]]; then
+        if open http://localhost:3000 2> /dev/null; then
+            log_info "Successfully opened http://localhost:3000 in your default browser"
+        else
+            log_warn "Failed to open http://localhost:3000. Please open it manually"
+        fi
+    else
+        log_info "Please open http://localhost:3000 in your host browser"
+    fi
+    
+    cd ..
+}
+
+# Wait for user data
+wait_for_user_data() {
+    log_info "Waiting for modal userData.json to be created..."
+    
+    local user_data_file="modal-login/temp-data/userData.json"
+    while [[ ! -f "$user_data_file" ]]; do
+        sleep 5
+    done
+    
+    log_info "Found userData.json. Proceeding..."
+    
+    # Extract ORG_ID
+    ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' "$user_data_file")
+    log_info "Your ORG_ID is set to: $ORG_ID"
+    export ORG_ID
+}
+
+# Wait for API key activation
+wait_for_api_activation() {
+    log_info "Waiting for API key to become activated..."
+    
+    while true; do
+        local status
+        status=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID" 2>/dev/null || echo "error")
+        
+        if [[ "$status" == "activated" ]]; then
+            log_info "API key is activated! Proceeding..."
+            break
+        else
+            log_info "Waiting for API key to be activated..."
+            sleep 5
+        fi
+    done
+}
+
+# =============================================================================
+# Ollama Installation
+# =============================================================================
+
+install_ollama() {
+    # Ollama already running as part of the docker compose file
+    if [[ -z "$DOCKER" ]]; then
+        echo_green ">> Installing Ollama requires 'sudo' privileges. As an alternative, please use the Docker installation path as described in README.md"
+        
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # Install brew if not already installed
+            if ! command -v brew > /dev/null 2>&1; then
+                log_info "Installing Homebrew..."
+                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            fi
+            
+            # Install ollama if not already installed
+            if ! command -v ollama > /dev/null 2>&1; then
+                log_info "Installing Ollama via Homebrew..."
+                brew install ollama
+            fi
+        else
+            # Install ollama if not already installed
+            if ! command -v ollama > /dev/null 2>&1; then
+                log_info "Installing Ollama..."
+                curl -fsSL https://ollama.com/install.sh | sh -s -- -y
+            fi
+        fi
+        
+        # Start ollama server if not already running
+        if ! ollama list > /dev/null 2>&1; then
+            log_info "Starting ollama server..."
+            nohup ollama serve > /tmp/ollama.log 2>&1 &
+        fi
+    fi
+}
+
+# =============================================================================
+# Python Dependencies Installation
+# =============================================================================
+
+install_python_deps() {
+    log_info "Getting requirements..."
+    pip install --upgrade pip
+    
+    log_info "Installing GenRL..."
+    pip install -r code_gen_exp/requirements.txt
+}
+
+# =============================================================================
+# Configuration Management
+# =============================================================================
+
+setup_config() {
+    log_info "Setting up configuration..."
+    
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir "$CONFIG_DIR"
+    fi
+    
+    local config_file="$CONFIG_DIR/code-gen-swarm.yaml"
+    local default_config="$ROOT/code_gen_exp/config/code-gen-swarm.yaml"
+    
+    if [[ -f "$config_file" ]]; then
+        if ! cmp -s "$default_config" "$config_file"; then
+            if [[ -z "$GENSYN_RESET_CONFIG" ]]; then
+                log_warn "Found differences in code-gen-swarm.yaml. Set GENSYN_RESET_CONFIG to reset to default."
+            else
+                log_info "Backing up existing config and resetting to default..."
+                mv "$config_file" "$config_file.bak"
+                cp "$default_config" "$config_file"
+            fi
+        fi
+    else
+        log_info "Copying default configuration..."
+        cp "$default_config" "$config_file"
+    fi
+    
+    # Set permissions for Docker
+    if [[ -n "$DOCKER" ]]; then
+        sudo chmod -R 0777 "$CONFIG_DIR"
+    fi
+}
+
+# =============================================================================
+# User Configuration
+# =============================================================================
+
+get_user_preferences() {
+    echo -en $GREEN_TEXT
+    read -p ">> Would you like to push models you train in the RL swarm to the Hugging Face Hub? [y/N] " yn
+    echo -en $RESET_TEXT
+    yn=${yn:-N}
+    
+    case $yn in
+        [Yy]*) 
+            read -p "Enter your Hugging Face access token: " HUGGINGFACE_ACCESS_TOKEN 
+            ;;
+        [Nn]*) 
+            HUGGINGFACE_ACCESS_TOKEN="None" 
+            ;;
+        *) 
+            echo ">>> No answer was given, so NO models will be pushed to Hugging Face Hub"
+            HUGGINGFACE_ACCESS_TOKEN="None" 
+            ;;
+    esac
+
+    echo -en $GREEN_TEXT
+    read -p ">> Enter the name of the model you want to use in huggingface repo/name format, or press [Enter] to use the default model. " MODEL_NAME
+    echo -en $RESET_TEXT
+
+    if [[ -n "$MODEL_NAME" ]]; then
+        export MODEL_NAME
+        echo_green ">> Using model: $MODEL_NAME"
+    else
+        echo_green ">> Using default model from config"
+    fi
+    
+    # Logout from HuggingFace to prevent env issues
+    if ! hf auth logout > /dev/null 2>&1; then
+        unset HF_TOKEN
+        unset HUGGING_FACE_HUB_TOKEN
+        hf auth logout > /dev/null 2>&1 || true
+    fi
+}
+
+# =============================================================================
+# Enhanced Error Handling and Process Management
+# =============================================================================
+
+# Cleanup server process
+cleanup_server() {
+    if [[ -n "$SERVER_PID" ]]; then
+        log_info "Stopping modal login server (PID: $SERVER_PID)..."
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+        SERVER_PID=""
+    fi
+}
+
+# Handle interruption signals
+handle_interrupt() {
+    log_warn "Received interrupt signal (Ctrl+C)..."
+    cleanup
+}
+
 cleanup() {
-    echo_green ">> Shutting down trainer..."
-
+    log_info "Shutting down trainer..."
+    
     # Remove modal credentials if they exist
-    rm -r $ROOT_DIR/modal-login/temp-data/*.json 2> /dev/null || true
-
+    rm -r "$ROOT/modal-login/temp-data"/*.json 2> /dev/null || true
+    
+    cleanup_server
+    
     # Kill all processes belonging to this script's process group
-    kill -- -$$ || true
-
+    kill -- -$$ 2>/dev/null || true
+    
     exit 0
 }
 
@@ -77,11 +434,13 @@ errnotify() {
     echo_red ">> An error was detected while running rl-swarm. See $ROOT/logs for full logs."
 }
 
-trap cleanup EXIT
-trap errnotify ERR
+# =============================================================================
+# Main Execution
+# =============================================================================
 
-echo -e "\033[38;5;224m"
-cat << "EOF"
+display_banner() {
+    echo -e "\033[38;5;224m"
+    cat << "EOF"
     ██████  ██            ███████ ██     ██  █████  ██████  ███    ███
     ██   ██ ██            ██      ██     ██ ██   ██ ██   ██ ████  ████
     ██████  ██      █████ ███████ ██  █  ██ ███████ ██████  ██ ████ ██
@@ -91,198 +450,55 @@ cat << "EOF"
     From Gensyn
 
 EOF
+    echo -e "$RESET_TEXT"
+}
 
-# Create logs directory if it doesn't exist
-mkdir -p "$ROOT/logs"
-
-if [ "$CONNECT_TO_TESTNET" = true ]; then
-    # Run modal_login server.
-    echo "Please login to create an Ethereum Server Wallet"
-    cd modal-login
-    # Check if the yarn command exists; if not, install Yarn.
-
-    # Node.js + NVM setup
-    if ! command -v node > /dev/null 2>&1; then
-        echo "Node.js not found. Installing NVM and latest Node.js..."
-        export NVM_DIR="$HOME/.nvm"
-        if [ ! -d "$NVM_DIR" ]; then
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-        fi
-        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-        nvm install node
-    else
-        echo "Node.js is already installed: $(node -v)"
+main() {
+    # Set up trap for cleanup and interrupt handling
+    trap handle_interrupt SIGINT SIGTERM
+    trap cleanup EXIT
+    trap errnotify ERR
+    
+    # Initialize
+    display_banner
+    init_directories
+    setup_docker_volumes
+    setup_system_limits
+    
+    # Testnet connection setup
+    if [[ "$CONNECT_TO_TESTNET" == "true" ]]; then
+        log_info "Setting up testnet connection..."
+        
+        install_nodejs
+        install_yarn
+        setup_modal_login
+        wait_for_user_data
+        wait_for_api_activation
     fi
+    
+    # Install dependencies
+    install_python_deps
+    install_ollama
+    setup_config
+    
+    echo_green ">> Done!"
+    
+    # Get user preferences
+    get_user_preferences
+    
+    # Final messages
+    echo -en $RESET_TEXT
+    echo_green ">> Good luck in the swarm!"
+    echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
+    
+    # Launch the swarm
+    log_info "Starting swarm launcher..."
+    python -m code_gen_exp.runner.swarm_launcher \
+        --config-path "$ROOT/code_gen_exp/config" \
+        --config-name "code-gen-swarm.yaml"
+    
+    wait  # Keep script running until Ctrl+C
+}
 
-    if ! command -v yarn > /dev/null 2>&1; then
-        # Detect Ubuntu (including WSL Ubuntu) and install Yarn accordingly
-        if grep -qi "ubuntu" /etc/os-release 2> /dev/null || uname -r | grep -qi "microsoft"; then
-            echo "Detected Ubuntu or WSL Ubuntu. Installing Yarn via apt..."
-            curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
-            echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
-            sudo apt update && sudo apt install -y yarn
-        else
-            echo "Yarn not found. Installing Yarn globally with npm (no profile edits)…"
-            # This lands in $NVM_DIR/versions/node/<ver>/bin which is already on PATH
-            npm install -g --silent yarn
-        fi
-    fi
-
-    ENV_FILE="$ROOT"/modal-login/.env
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS version
-        sed -i '' "3s/.*/SWARM_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$ENV_FILE"
-
-    else
-        # Linux version
-        sed -i "3s/.*/SWARM_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$ENV_FILE"
-    fi
-
-
-    # Docker image already builds it, no need to again.
-    if [ -z "$DOCKER" ]; then
-        yarn install --immutable
-        echo "Building server"
-        yarn build > "$ROOT/logs/yarn.log" 2>&1
-    fi
-    yarn start >> "$ROOT/logs/yarn.log" 2>&1 & # Run in background and log output
-
-    SERVER_PID=$!  # Store the process ID
-    echo "Started server process: $SERVER_PID"
-    sleep 5
-
-    # Try to open the URL in the default browser
-    if [ -z "$DOCKER" ]; then
-        if open http://localhost:3000 2> /dev/null; then
-            echo_green ">> Successfully opened http://localhost:3000 in your default browser."
-        else
-            echo ">> Failed to open http://localhost:3000. Please open it manually."
-        fi
-    else
-        echo_green ">> Please open http://localhost:3000 in your host browser."
-    fi
-
-    cd ..
-
-    echo_green ">> Waiting for modal userData.json to be created..."
-    while [ ! -f "modal-login/temp-data/userData.json" ]; do
-        sleep 5  # Wait for 5 seconds before checking again
-    done
-    echo "Found userData.json. Proceeding..."
-
-    ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' modal-login/temp-data/userData.json)
-    echo "Your ORG_ID is set to: $ORG_ID"
-
-    # Wait until the API key is activated by the client
-    echo "Waiting for API key to become activated..."
-    while true; do
-        STATUS=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID")
-        if [[ "$STATUS" == "activated" ]]; then
-            echo "API key is activated! Proceeding..."
-            break
-        else
-            echo "Waiting for API key to be activated..."
-            sleep 5
-        fi
-    done
-fi
-
-echo_green ">> Getting requirements..."
-pip install --upgrade pip
-
-echo_green ">> Installing GenRL..."
-
-# Ollama already running as part of the docker compose file
-if [ -z "$DOCKER" ]; then
-    echo_green ">> Installing Ollama requires 'sudo' privileges. As an alternative, please use the Docker installation path as described in README.md"
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # Install brew if not already installed
-        if ! command -v brew > /dev/null 2>&1; then
-            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        fi
-        # Install ollama if not already installed
-        if ! command -v ollama > /dev/null 2>&1; then
-            brew install ollama
-        fi
-    else
-        # Install ollama if not already installed
-        if ! command -v ollama > /dev/null 2>&1; then
-            curl -fsSL https://ollama.com/install.sh | sh -s -- -y
-        fi
-    fi
-    # Start ollama server if not already running, check by running ollama list
-    if ! ollama list > /dev/null 2>&1; then
-        echo ">> Starting ollama server..."
-        nohup ollama serve > /tmp/ollama.log 2>&1 &
-    fi
-fi
-
-pip install -r code_gen_exp/requirements.txt
-
-if [ ! -d "$ROOT/configs" ]; then
-    mkdir "$ROOT/configs"
-fi  
-if [ -f "$ROOT/configs/code-gen-swarm.yaml" ]; then
-    # Use cmp -s for a silent comparison. If different, backup and copy.
-    if ! cmp -s "$ROOT/code_gen_exp/config/code-gen-swarm.yaml" "$ROOT/configs/code-gen-swarm.yaml"; then
-        if [ -z "$GENSYN_RESET_CONFIG" ]; then
-            echo_green ">> Found differences in code-gen-swarm.yaml. If you would like to reset to the default, set GENSYN_RESET_CONFIG to a non-empty value."
-        else
-            echo_green ">> Found differences in code-gen-swarm.yaml. Backing up existing config."
-            mv "$ROOT/configs/code-gen-swarm.yaml" "$ROOT/configs/code-gen-swarm.yaml.bak"
-            cp "$ROOT/code_gen_exp/config/code-gen-swarm.yaml" "$ROOT/configs/code-gen-swarm.yaml"
-        fi
-    fi
-else
-    # If the config doesn't exist, just copy it.
-    cp "$ROOT/code_gen_exp/config/code-gen-swarm.yaml" "$ROOT/configs/code-gen-swarm.yaml"
-fi
-
-if [ -n "$DOCKER" ]; then
-    # Make it easier to edit the configs on Linux systems.
-    sudo chmod -R 0777 /home/gensyn/rl_swarm/configs
-fi
-
-echo_green ">> Done!"
-
-
-echo -en $GREEN_TEXT
-read -p ">> Would you like to push models you train in the RL swarm to the Hugging Face Hub? [y/N] " yn
-echo -en $RESET_TEXT
-yn=${yn:-N} # Default to "N" if the user presses Enter
-case $yn in
-    [Yy]*) read -p "Enter your Hugging Face access token: " HUGGINGFACE_ACCESS_TOKEN ;;
-    [Nn]*) HUGGINGFACE_ACCESS_TOKEN="None" ;;
-    *) echo ">>> No answer was given, so NO models will be pushed to Hugging Face Hub" && HUGGINGFACE_ACCESS_TOKEN="None" ;;
-esac
-
-
-echo -en $GREEN_TEXT
-read -p ">> Enter the name of the model you want to use in huggingface repo/name format, or press [Enter] to use the default model. " MODEL_NAME
-echo -en $RESET_TEXT
-
-# Only export MODEL_NAME if user provided a non-empty value
-if [ -n "$MODEL_NAME" ]; then
-    export MODEL_NAME
-    echo_green ">> Using model: $MODEL_NAME"
-else
-    echo_green ">> Using default model from config"
-fi
-#logout to prevent weird env issues, if it fails unset and try again
-if ! hf auth logout > /dev/null 2>&1; then
-    unset HF_TOKEN
-    unset HUGGING_FACE_HUB_TOKEN
-    # if it fails a second time, report stderr
-    hf auth logout > /dev/null 2>&1
-fi
-
-echo -en $RESET_TEXT
-echo_green ">> Good luck in the swarm!"
-echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
-
-python -m code_gen_exp.runner.swarm_launcher \
-    --config-path "$ROOT/code_gen_exp/config" \
-    --config-name "code-gen-swarm.yaml" 
-
-wait  # Keep script running until Ctrl+C
+# Execute main function
+main "$@"
