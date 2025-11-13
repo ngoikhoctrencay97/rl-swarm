@@ -231,22 +231,41 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
                 print("[GRPOTrainerModule] Tokenizing prompts")
                 input_ids_list = []
                 for prompt in prompts:
-                    # Check if it's a list of messages or dict
-                    if isinstance(prompt, dict) and 'messages' in prompt:
-                        messages = prompt['messages']
+                    # Check if it's already a formatted prompt string
+                    if isinstance(prompt, dict):
+                        # Priority order: prompt > user_prompt > messages
+                        if 'prompt' in prompt and isinstance(prompt['prompt'], (list, str)):
+                            messages = prompt['prompt']
+                        elif 'messages' in prompt:
+                            messages = prompt['messages']
+                        elif 'user_prompt' in prompt:
+                            # Build messages from system_prompt and user_prompt
+                            messages = []
+                            if 'system_prompt' in prompt and prompt['system_prompt']:
+                                messages.append({"role": "system", "content": prompt['system_prompt']})
+                            messages.append({"role": "user", "content": prompt['user_prompt']})
+                        else:
+                            # Fallback: treat whole dict as single message
+                            messages = [{"role": "user", "content": str(prompt)}]
                     elif isinstance(prompt, list):
                         messages = prompt
+                    elif isinstance(prompt, str):
+                        messages = [{"role": "user", "content": prompt}]
                     else:
-                        # Assume it's a single message - wrap it
                         messages = [{"role": "user", "content": str(prompt)}]
                     
-                    ids = self.processing_class.apply_chat_template(
-                        messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        return_tensors="pt"
-                    )
-                    input_ids_list.append(ids)
+                    try:
+                        ids = self.processing_class.apply_chat_template(
+                            messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            return_tensors="pt"
+                        )
+                        input_ids_list.append(ids)
+                    except Exception as e:
+                        print(f"[GRPOTrainerModule] Tokenization error: {e}", file=sys.stderr)
+                        print(f"[GRPOTrainerModule] Messages: {messages}", file=sys.stderr)
+                        raise
                 
                 # Pad to same length
                 max_len = max(ids.shape[1] for ids in input_ids_list)
@@ -288,11 +307,17 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             "eos_token_id": self._local_tokenizer.eos_token_id if self._local_tokenizer else 1,
         }
 
-        # Remove any dangerous parameters
+        # Remove any dangerous parameters from kwargs
         dangerous_keys = ['temperature', 'top_k', 'top_p', 'renormalize_logits', 
-                         'typical_p', 'penalty_alpha', 'repetition_penalty']
-        for key in dangerous_keys:
-            gen_kwargs.pop(key, None)
+                         'typical_p', 'penalty_alpha', 'repetition_penalty', 
+                         'do_sample', 'num_beams', 'num_beam_groups']
+        
+        # Clean kwargs completely - only keep safe ones
+        safe_keys = ['max_new_tokens', 'max_length', 'min_length']
+        cleaned_kwargs = {k: v for k, v in kwargs.items() if k in safe_keys}
+        
+        # Merge with our safe defaults
+        gen_kwargs.update(cleaned_kwargs)
 
         print(f"[GRPOTrainerModule] Generating with greedy decoding (batch_size={input_ids.shape[0]})")
 
@@ -335,6 +360,18 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
                 padded_outputs.append(o)
 
         return torch.cat(padded_outputs, dim=0).to(device)
+    
+    # ===============================================================
+    #  DEBUG: Check what we generated
+    # ===============================================================
+    def _debug_outputs(self, outputs):
+        """Debug helper to see what was generated"""
+        try:
+            if self._local_tokenizer:
+                decoded = self._local_tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print(f"[GRPOTrainerModule] Generated text (first sample): {decoded[:200]}...")
+        except Exception as e:
+            print(f"[GRPOTrainerModule] Could not decode output: {e}", file=sys.stderr)
 
     # ===============================================================
     #  EVALUATE
