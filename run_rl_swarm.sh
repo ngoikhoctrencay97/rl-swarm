@@ -476,7 +476,7 @@ main() {
     echo_green ">> Done!"
     
     # Get user preferences
-    get_user_preferences
+    #get_user_preferences
     
     # Final messages
     echo -en $RESET_TEXT
