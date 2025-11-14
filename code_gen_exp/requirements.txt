@@ -4,3 +4,4 @@ hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5
 bitsandbytes
 accelerate
 colorama
+peft
