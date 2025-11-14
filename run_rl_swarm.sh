@@ -413,12 +413,14 @@ cleanup_server() {
 # Handle interruption signals
 handle_interrupt() {
     log_warn "Received interrupt signal (Ctrl+C)..."
+
     cleanup
 }
 
 cleanup() {
     log_info "Shutting down trainer..."
     cleanup_server
+    kill -- -$$ || true
     exit 0
 }
 
