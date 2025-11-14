@@ -17,7 +17,7 @@ training:
   num_generations: 2
   num_transplant_trees: 2
   seed: 42
-  dtype: float16
+  dtype: bfloat16
   max_new_tokens: 256
 
 reward_config:
@@ -52,7 +52,7 @@ game_manager:
     stage: 0
   trainer:
     _target_: code_gen_exp.src.trainer.GRPOTrainerModule
-    dtype: float16
+    dtype: bfloat16
     models:
       - _target_: transformers.AutoModelForCausalLM.from_pretrained
         pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Qwen/Qwen2.5-Coder-0.5B-Instruct}
