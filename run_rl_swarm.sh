@@ -413,14 +413,16 @@ cleanup_server() {
 # Handle interruption signals
 handle_interrupt() {
     log_warn "Received interrupt signal (Ctrl+C)..."
-
+    pkill -9 -P $$ 2>/dev/null || true
+    kill -- -$$ 2>/dev/null || true
     cleanup
 }
 
 cleanup() {
     log_info "Shutting down trainer..."
+    pkill -9 -P $$ 2>/dev/null || true
+    kill -- -$$ 2>/dev/null || true
     cleanup_server
-    kill -- -$$ || true
     exit 0
 }
 
@@ -449,7 +451,8 @@ EOF
 
 main() {
     # Set up trap for cleanup and interrupt handling
-    trap handle_interrupt SIGINT SIGTERM
+    trap 'handle_interrupt' INT TERM
+    set -m
     trap cleanup EXIT
     trap errnotify ERR
     
