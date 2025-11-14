@@ -193,7 +193,7 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         if not signal_by_agent:
             return 0
         my_signal = signal_by_agent.get(self.peer_id, 0)
-        return (my_signal + 1) * (my_signal > 0) + my_signal * (my_signal <= 0)
+        return (my_signal + 1) * (my_signal > 0) + 0 * (my_signal <= 0)
 
     def _format_time_remaining(self, hours_remaining):
         """Format time remaining in a readable way"""
