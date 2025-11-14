@@ -71,8 +71,8 @@ game_manager:
       num_generations: ${training.num_generations}
       load_in_4bit: true
       use_lora: true
-      lora_r: 16
-      lora_alpha: 32
+      lora_r: 32
+      lora_alpha: 64
       lora_dropout: 0.05
     log_with: wandb
     log_dir: ${log_dir}
