@@ -21,7 +21,7 @@ training:
   max_new_tokens: 256
 
 reward_config:
-  ollama_model: qwen2.5-coder:0.5b-instruct
+  ollama_model: qwen2.5-coder:1.5b-instruct
   temperature: 0.0
   num_predict: 256
 
@@ -52,16 +52,9 @@ game_manager:
     stage: 0
   trainer:
     _target_: code_gen_exp.src.trainer.GRPOTrainerModule
-    dtype: bfloat16                    # optional for non-kbit path
     models:
       - _target_: transformers.AutoModelForCausalLM.from_pretrained
         pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Qwen/Qwen2.5-Coder-0.5B-Instruct}
-        device_map: "auto"
-        quantization_config:
-          _target_: transformers.BitsAndBytesConfig
-          load_in_4bit: True
-          bnb_4bit_use_double_quant: true
-          bnb_4bit_quant_type: "nf4"
     config:
       _target_: genrl.trainer.grpo_trainer.GRPOTrainerConfig
       dtype: ${training.dtype}
@@ -69,11 +62,6 @@ game_manager:
       epsilon_high: 0.28
       max_new_tokens: ${training.max_new_tokens}
       num_generations: ${training.num_generations}
-      load_in_4bit: true
-      use_lora: true
-      lora_r: 32
-      lora_alpha: 64
-      lora_dropout: 0.05
     log_with: wandb
     log_dir: ${log_dir}
     judge_base_url: ${eval.judge_base_url}
@@ -144,6 +132,3 @@ proposer:
     org_id: ${blockchain.org_id}
     modal_proxy_url: ${blockchain.modal_proxy_url}
     swarm_coordinator_abi_json: ${blockchain.swarm_coordinator_abi_path}
-
-    
-    
